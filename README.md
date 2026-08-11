@@ -1,5 +1,8 @@
 # dr1wbot
 
+[![CI](https://github.com/faustyu1/dr1wbot/actions/workflows/ci.yml/badge.svg)](https://github.com/faustyu1/dr1wbot/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+
 Telegram guest-бот: зовёшь `@botname` в любом чате — он отвечает текстом от Gemini, отрендеренным нативным Telegram Markdown. Работает и в личке, с админ-панелью на кнопках. Go + [telego](https://github.com/mymmrac/telego), в Docker.
 
 Без БД: всё состояние — три JSON-файла рядом с бинарником (вайтлист, счётчики лимитов, настройки из панели). Контекст диалога живёт в памяти процесса и не переживает перезапуск — это осознанно, разговор в чате не то, что стоит хранить.
