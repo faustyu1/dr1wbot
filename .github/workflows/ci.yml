@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first run pointless, so let it go.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          # Read the version from go.mod rather than repeating it here, so a
+          # toolchain bump is one edit instead of two that can disagree.
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        # gofmt -l prints the files it would change and exits 0 either way, so
+        # the emptiness of its output is the actual assertion.
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        # -race because the bot answers several summons at once and shares a key
+        # ring, a quota store and a settings store between them.
+        run: go test -race ./...
+
+      - name: Build
+        run: go build ./...
