@@ -1,0 +1,26 @@
+services:
+  bot:
+    build: .
+    image: dr1wbot
+    container_name: dr1wbot
+    env_file: .env
+    restart: unless-stopped
+    # Long polling: the bot dials out to Telegram, so no ports are published
+    # and no public domain or TLS certificate is needed.
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
+    # The root filesystem stays read-only; only the whitelist state is writable.
+    read_only: true
+    cap_drop:
+      - ALL
+    volumes:
+      - state:/data
+
+volumes:
+  state:

@@ -1,0 +1,17 @@
+# Secrets. .env holds the bot token and the API keys; nothing matching it may
+# ever be tracked.
+.env
+.env.*
+!.env.example
+
+# Runtime state, written by the bot itself.
+/state.json
+/quota.json
+/settings.json
+
+# Build output.
+/dr1wbot
+/out/
+
+# Local scratch.
+/test.py
