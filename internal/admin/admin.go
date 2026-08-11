@@ -101,7 +101,7 @@ func (c *Commands) unban(args []string) string {
 		return "⚠️ Публичный доступ выключен — банить некого."
 	}
 	if len(args) != 1 {
-		return "Нужен ровно один id: `/unban 821609332`"
+		return "Нужен ровно один id: `/unban 123456789`"
 	}
 	id, err := strconv.ParseInt(args[0], 10, 64)
 	if err != nil {
@@ -118,9 +118,9 @@ func (c *Commands) unban(args []string) string {
 
 // mutate handles /add and /del, which differ only in the verb.
 func (c *Commands) mutate(args []string, adding bool) string {
-	usage := "`/del <id>` — например, `/del 821609332`"
+	usage := "`/del <id>` — например, `/del 123456789`"
 	if adding {
-		usage = "`/add <id>` — например, `/add 821609332`"
+		usage = "`/add <id>` — например, `/add 123456789`"
 	}
 
 	if len(args) != 1 {

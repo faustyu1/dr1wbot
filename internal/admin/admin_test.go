@@ -45,7 +45,7 @@ func TestNonCommandsAreLeftToTheModel(t *testing.T) {
 		"",
 		"   ",
 		"что такое кворум?",
-		"add 821609332",             // the mistake that started this: no slash
+		"add 123456789",             // the mistake that started this: no slash
 		"расскажи про /add в linux", // a slash that is not the first word
 		"/unknown 123",
 		"/",
@@ -76,14 +76,14 @@ func TestAdd(t *testing.T) {
 	store := newFakeStore()
 	c := New(store)
 
-	reply, handled := c.Handle("/add 821609332", adminID)
+	reply, handled := c.Handle("/add 123456789", adminID)
 	if !handled {
 		t.Fatal("Handle() handled = false, want true")
 	}
-	if len(store.added) != 1 || store.added[0] != 821609332 {
-		t.Errorf("added = %v, want [821609332]", store.added)
+	if len(store.added) != 1 || store.added[0] != 123456789 {
+		t.Errorf("added = %v, want [123456789]", store.added)
 	}
-	if !strings.Contains(reply, "821609332") {
+	if !strings.Contains(reply, "123456789") {
 		t.Errorf("reply = %q, want it to confirm the id", reply)
 	}
 }

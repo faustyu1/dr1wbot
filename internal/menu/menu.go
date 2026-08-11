@@ -193,6 +193,11 @@ var (
 // cannot be mistaken for a menu press.
 const callbackPrefix = "menu:"
 
+// sourceURL is where this program's source lives. AGPL-3.0 asks that users
+// interacting with the program over a network be told, and the help screen is
+// where that belongs. A fork should point this at its own repository.
+const sourceURL = "https://github.com/faustyu1/dr1wbot"
+
 // HandleMessage serves one private-chat message. It reports whether the
 // message was a menu command: anything else is an ordinary question, and the
 // caller answers it the same way it answers a summon. Greeting somebody who
@@ -735,8 +740,14 @@ func (h *Handler) helpScreen() (string, *telego.InlineKeyboardMarkup) {
 	fmt.Fprintf(&b, "<b>Флаг <code>-s</code></b> — первым словом в вопросе снимает домашний стиль ответа:\n")
 	fmt.Fprintf(&b, "<blockquote><code>@%s -s распиши подробно, ничего не сокращай</code></blockquote>\n\n",
 		h.botUsername)
-	fmt.Fprintf(&b, "%s Положительный id — человек, отрицательный — группа или канал.",
+	fmt.Fprintf(&b, "%s Положительный id — человек, отрицательный — группа или канал.\n\n",
 		tgemoji.Tag(tgemoji.IDInfo, "ℹ️"))
+
+	// AGPL asks that a program offered over a network tell its users where the
+	// source is. This is that notice, and it is also just useful.
+	fmt.Fprintf(&b, "%s Исходники: %s\nЛицензия AGPL-3.0 — пользоваться и продавать можно, "+
+		"свой форк обязан остаться открытым.",
+		tgemoji.Tag(tgemoji.IDCode, "🔨"), sourceURL)
 
 	return b.String(), keys(row(backButton()))
 }

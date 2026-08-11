@@ -1,5 +1,14 @@
 // Command bot runs dr1wbot: a Telegram guest-mode bot that answers when
 // mentioned, using an OpenAI-compatible LLM backend.
+//
+// Copyright (C) 2026 faustyu1.
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU Affero General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your option) any
+// later version. It is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; see the GNU Affero General Public License for details.
+// You should have received a copy of the license along with this program; if
+// not, see <https://www.gnu.org/licenses/>.
 package main
 
 import (
