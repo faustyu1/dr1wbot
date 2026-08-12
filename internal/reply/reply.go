@@ -676,10 +676,9 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 // answer can replace it in place.
 func (h *Handler) sendPlaceholder(ctx context.Context, chatID int64) (int, error) {
 	sent, err := h.sender.SendMessage(ctx, &telego.SendMessageParams{
-		ChatID:      telego.ChatID{ID: chatID},
-		Text:        tgemoji.Placeholder(),
-		ParseMode:   telego.ModeHTML,
-		ReplyMarkup: replyKeyboard(),
+		ChatID:    telego.ChatID{ID: chatID},
+		Text:      tgemoji.Placeholder(),
+		ParseMode: telego.ModeHTML,
 	})
 	if err == nil {
 		return sent.MessageID, nil
@@ -726,8 +725,21 @@ func (h *Handler) editChatText(parent context.Context, chatID int64, messageID i
 		Text:               tgemoji.Strip(html),
 		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
 	})
-	if plainErr != nil {
-		return errors.Join(err, plainErr)
+	if plainErr == nil {
+		return nil
+	}
+
+	// Last resort: edit failed entirely, send a new message so the answer
+	// is never lost.
+	h.log.Warn("edit failed, sending as new message", "err", plainErr)
+	_, sendErr := h.sender.SendMessage(ctx, &telego.SendMessageParams{
+		ChatID:             telego.ChatID{ID: chatID},
+		Text:               html,
+		ParseMode:          telego.ModeHTML,
+		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
+	})
+	if sendErr != nil {
+		return errors.Join(err, plainErr, sendErr)
 	}
 	return nil
 }
