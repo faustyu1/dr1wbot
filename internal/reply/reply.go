@@ -1380,7 +1380,7 @@ func (h *Handler) handleReset(ctx context.Context, chatID, userID int64) error {
 	defer cancel()
 	_, err = h.sender.SendMessage(sendCtx, &telego.SendMessageParams{
 		ChatID:             telego.ChatID{ID: chatID},
-		Text:               "<b>Контекст сброшен</b>",
+		Text:               "Контекст сброшен.",
 		ParseMode:          telego.ModeHTML,
 		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
 		ReplyMarkup:        kb,

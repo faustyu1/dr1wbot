@@ -402,7 +402,7 @@ func (h *Handler) HandleCallback(ctx context.Context, query telego.CallbackQuery
 		if err != nil || hash == "" {
 			_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
 				ChatID:             telego.ChatID{ID: chatID},
-				Text:               "<b>Контекст сброшен</b>",
+				Text:               "Контекст сброшен.",
 				ParseMode:          telego.ModeHTML,
 				LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
 			})
@@ -416,7 +416,7 @@ func (h *Handler) HandleCallback(ctx context.Context, query telego.CallbackQuery
 		}
 		_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
 			ChatID:             telego.ChatID{ID: chatID},
-			Text:               "<b>Контекст сброшен</b>",
+			Text:               "Контекст сброшен.",
 			ParseMode:          telego.ModeHTML,
 			LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
 			ReplyMarkup:        kb,
