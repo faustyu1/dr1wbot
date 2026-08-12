@@ -168,6 +168,9 @@ func (f *fakeSender) EditMessageMedia(_ context.Context, p *telego.EditMessageMe
 	}
 	return nil, nil
 }
+func (f *fakeSender) DeleteMessage(_ context.Context, _ *telego.DeleteMessageParams) error {
+	return nil
+}
 
 func (f *fakeSender) snapshot() ([]string, []editCall) {
 	f.mu.Lock()

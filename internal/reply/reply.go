@@ -42,6 +42,7 @@ type Sender interface {
 	EditMessageText(ctx context.Context, params *telego.EditMessageTextParams) (*telego.Message, error)
 	SendPhoto(ctx context.Context, params *telego.SendPhotoParams) (*telego.Message, error)
 	EditMessageMedia(ctx context.Context, params *telego.EditMessageMediaParams) (*telego.Message, error)
+	DeleteMessage(ctx context.Context, params *telego.DeleteMessageParams) error
 	// SendMessage serves the private chat, which is not guest mode: there is
 	// no query to answer once, so a reply is simply sent.
 	SendMessage(ctx context.Context, params *telego.SendMessageParams) (*telego.Message, error)
@@ -111,39 +112,41 @@ const (
 	msgEmptyPrompt   = "Позови меня с вопросом — или ответь мной на сообщение, которое нужно разобрать."
 	promptForPicture = "Разбери, что на изображении."
 	msgEmptyDrawing  = "Опиши, что нарисовать. Например: `нарисуй кота в скафандре`."
-	msgBusy          = "⚠️ Сейчас слишком много запросов. Попробуй ещё раз через минуту."
-	msgTimeout       = "⚠️ Модель не ответила вовремя. Попробуй ещё раз."
-	msgFailed        = "⚠️ Не получилось получить ответ от модели."
-	msgRateLimited   = "⚠️ Лимиты исчерпаны на всех ключах и моделях. " +
+	msgBusy          = "Сейчас слишком много запросов. Попробуй ещё раз через минуту."
+	msgTimeout       = "Модель не ответила вовремя. Попробуй ещё раз."
+	msgFailed        = "Не получилось получить ответ от модели."
+	msgRateLimited   = "Лимиты исчерпаны на всех ключах и моделях. " +
 		"Снять лимит — добавить ещё ключ в OPENAI_API_KEYS или включить биллинг."
 	// msgCommandExpired is what an admin command's answer decays into. Guest
 	// answers are inline messages, and the Bot API cannot delete those — only
 	// edit them — so the closest thing to cleaning up after a command is
 	// shrinking its output to a single character.
 	msgCommandExpired = "✓"
-	msgImagesOff      = "⚠️ Генерация картинок выключена."
+	msgImagesOff      = "Генерация картинок выключена."
 	// msgDrawingIsPrivate keeps the paid path off the public allowance: a
 	// picture costs real money, a question costs quota.
-	msgDrawingIsPrivate = "⚠️ Рисовать могу только тем, кто есть в списке доступа."
-	msgTooLong          = "⚠️ Слишком длинный вопрос. Сократи — так я отвечу быстрее и точнее."
-	msgAlreadyBusy      = "⚠️ Я ещё думаю над твоим прошлым вопросом. Дождись ответа."
-	msgBotExhausted     = "⚠️ На сегодня бот исчерпал общий дневной лимит. Возвращайся после полуночи UTC."
-	msgImageFailed      = "⚠️ Не получилось нарисовать. Модель могла отказаться от такого запроса."
-	msgImageTimeout     = "⚠️ Картинка рисовалась слишком долго. Попробуй ещё раз."
-	msgImageRejected    = "⚠️ Картинка сгенерировалась, но Telegram её не принял."
-	msgNoCredits        = "⚠️ Нечем оплатить картинку: генерация картинок платная. " +
+	msgDrawingIsPrivate = "Рисовать могу только тем, кто есть в списке доступа."
+	msgTooLong          = "Слишком длинный вопрос. Сократи — так я отвечу быстрее и точнее."
+	msgAlreadyBusy      = "Я ещё думаю над твоим прошлым вопросом. Дождись ответа."
+	msgBotExhausted     = "На сегодня бот исчерпал общий дневной лимит. Возвращайся после полуночи UTC."
+	msgImageFailed      = "Не получилось нарисовать. Модель могла отказаться от такого запроса."
+	msgImageTimeout     = "Картинка рисовалась слишком долго. Попробуй ещё раз."
+	msgImageRejected    = "Картинка сгенерировалась, но Telegram её не принял."
+	msgNoCredits        = "Нечем оплатить картинку: генерация картинок платная. " +
 		"Нужен ключ от проекта с включённым биллингом."
 
 	// cmdNewChat is the bottom keyboard button. Pressing it sends this exact
 	// text as a message; HandleDirectMessage maps it to /reset.
-	cmdNewChat = "Новый чат"
+	cmdNewChat  = "Новый чат"
+	cmdContinue = "Продолжить"
+	cmdMenu     = "Меню"
 )
 
 // msgQuotaSpent tells a public user their day is over. The number is in the
 // text because "you hit the limit" without it is the most annoying possible
 // version of this message.
 func msgQuotaSpent(limit int) string {
-	return fmt.Sprintf("⚠️ На сегодня всё: %d запросов в сутки на человека. "+
+	return fmt.Sprintf("На сегодня всё: %d запросов в сутки на человека. "+
 		"Счётчик обнуляется в полночь UTC.", limit)
 }
 
@@ -564,12 +567,12 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 		if h.sessionArchiver != nil {
 			return h.handleReset(ctx, msg.Chat.ID, userID)
 		}
-	case "/clearcache":
-		return h.handleClearCache(ctx, msg.Chat.ID)
-	case "/sessions":
+	case cmdContinue, "/sessions":
 		if h.sessionArchiver != nil {
 			return h.handleSessionsList(ctx, msg.Chat.ID, userID)
 		}
+	case "/clearcache":
+		return h.handleClearCache(ctx, msg.Chat.ID)
 	}
 
 	if h.commands != nil {
@@ -676,10 +679,9 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 // answer can replace it in place.
 func (h *Handler) sendPlaceholder(ctx context.Context, chatID int64) (int, error) {
 	sent, err := h.sender.SendMessage(ctx, &telego.SendMessageParams{
-		ChatID:      telego.ChatID{ID: chatID},
-		Text:        tgemoji.Placeholder(),
-		ParseMode:   telego.ModeHTML,
-		ReplyMarkup: replyKeyboard(),
+		ChatID:    telego.ChatID{ID: chatID},
+		Text:      tgemoji.Placeholder(),
+		ParseMode: telego.ModeHTML,
 	})
 	if err == nil {
 		return sent.MessageID, nil
@@ -730,15 +732,18 @@ func (h *Handler) editChatText(parent context.Context, chatID int64, messageID i
 		return nil
 	}
 
-	// Last resort: edit failed entirely, send a new message so the answer
-	// is never lost.
+	// Last resort: delete the placeholder and send the answer as a new
+	// message, so the user does not see both.
 	h.log.Warn("edit failed, sending as new message", "err", plainErr)
+	_ = h.sender.DeleteMessage(ctx, &telego.DeleteMessageParams{
+		ChatID:    telego.ChatID{ID: chatID},
+		MessageID: messageID,
+	})
 	_, sendErr := h.sender.SendMessage(ctx, &telego.SendMessageParams{
 		ChatID:             telego.ChatID{ID: chatID},
 		Text:               html,
 		ParseMode:          telego.ModeHTML,
 		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
-		ReplyMarkup:        replyKeyboard(),
 	})
 	if sendErr != nil {
 		return errors.Join(err, plainErr, sendErr)
@@ -750,7 +755,15 @@ func (h *Handler) editChatText(parent context.Context, chatID int64, messageID i
 // chats. It lets the user start a new conversation without typing /reset.
 func replyKeyboard() *telego.ReplyKeyboardMarkup {
 	return &telego.ReplyKeyboardMarkup{
-		Keyboard:       [][]telego.KeyboardButton{{telego.KeyboardButton{Text: cmdNewChat}}},
+		Keyboard: [][]telego.KeyboardButton{
+			{
+				telego.KeyboardButton{Text: cmdNewChat},
+				telego.KeyboardButton{Text: cmdContinue},
+			},
+			{
+				telego.KeyboardButton{Text: cmdMenu},
+			},
+		},
 		ResizeKeyboard: true,
 	}
 }
@@ -1385,7 +1398,7 @@ func (h *Handler) handleReset(ctx context.Context, chatID, userID int64) error {
 	}
 	link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, hash)
 	text := fmt.Sprintf(
-		"Контекст сброшен.\n\n<a href=\"%s\">продолжить старый</a>",
+		"Контекст сброшен. Старый диалог сохранён.\n\n<a href=\"%s\">Продолжить старый чат</a>",
 		link)
 	return h.sendPlain(ctx, chatID, text)
 }
@@ -1406,18 +1419,18 @@ func (h *Handler) handleSessionsList(ctx context.Context, chatID, userID int64) 
 	entries := h.sessionArchiver.Archives(userID)
 	if len(entries) == 0 {
 		return h.sendPlain(ctx, chatID,
-			"Нет сохранённых сессий.\nНажмите «Новый чат» — текущий диалог сохранится автоматически.")
+			"Нет сохранённых сессий.\n\nНажмите «Новый чат», чтобы сбросить контекст — текущий диалог сохранится автоматически.")
 	}
 
 	var b strings.Builder
-	b.WriteString("<b>Сохранённые сессии:</b>\n\n")
+	b.WriteString("<b>Сохранённые сессии</b>\n\n")
 	for i, e := range entries {
 		link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, e.Hash)
 		date := ""
 		if t, err := time.Parse(time.RFC3339, e.Created); err == nil {
 			date = t.Format("2 Jan 15:04") + " — "
 		}
-		b.WriteString(fmt.Sprintf("%d. %s%s\n   %d сообщений — <a href=\"%s\">открыть</a>\n\n",
+		b.WriteString(fmt.Sprintf("<b>%d.</b> %s%s\n   %d сообщ. — <a href=\"%s\">открыть</a>\n\n",
 			i+1, date, html.EscapeString(e.Preview), e.Turns, link))
 	}
 	return h.sendPlain(ctx, chatID, b.String())

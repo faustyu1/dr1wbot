@@ -267,10 +267,8 @@ func (h *Handler) HandleMessage(ctx context.Context, msg telego.Message) (handle
 	switch command {
 	case "/start", "/help":
 		return true, h.handleStart(ctx, msg)
-	case "/admin":
+	case "/admin", "Меню":
 		if !h.roster.IsAdmin(userID) {
-			// Saying "not an admin" would confirm the menu exists; the greeting
-			// says nothing either way.
 			return true, h.send(ctx, msg.Chat.ID, h.greeting(userID), nil)
 		}
 		text, keyboard := h.screen(screenMain, userID)
@@ -459,23 +457,17 @@ func (h *Handler) turn(knob string) error {
 // it they get, because both questions arrive constantly otherwise.
 func (h *Handler) greeting(userID int64) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "<b>Привет!</b>\n\n")
-	if h.imagesOn {
-		fmt.Fprintf(&b, "Отвечу на вопрос, разберу картинку или продолжу разговор.\n\n")
-	} else {
-		fmt.Fprintf(&b, "Отвечу на вопрос или продолжу разговор.\n\n")
-	}
-	fmt.Fprintf(&b, "В личке пишу как собеседник — с памятью. Кнопка «Новый чат» внизу сбрасывает контекст. /sessions — сохранённые диалоги.\n\n")
+	fmt.Fprintf(&b, "<b>Привет.</b>\n")
+	fmt.Fprintf(&b, "Пиши вопрос — отвечу. Внизу кнопки: новый чат, продолжить, меню.\n\n")
 
 	switch {
 	case h.roster.IsAdmin(userID):
-		fmt.Fprintf(&b, "Ты админ — кнопка «панель» ниже.")
+		fmt.Fprintf(&b, "Ты админ — кнопка «Меню» открывает панель.")
 	case h.ration != nil && h.ration.Enabled():
 		used, limit := h.ration.Peek(userID)
-		fmt.Fprintf(&b, "Сегодня осталось <b>%d</b> из %d запросов. Счётчик обнуляется в полночь UTC.",
-			max(limit-used, 0), limit)
+		fmt.Fprintf(&b, "Осталось <b>%d</b> из %d запросов сегодня.", max(limit-used, 0), limit)
 	default:
-		fmt.Fprintf(&b, "Бот приватный: отвечаю только тем, кто есть в списке доступа.")
+		fmt.Fprintf(&b, "Доступ по списку. /sessions — сохранённые диалоги.")
 	}
 	return b.String()
 }
@@ -494,24 +486,15 @@ func (h *Handler) handleStart(ctx context.Context, msg telego.Message) error {
 				return h.send(ctx, msg.Chat.ID,
 					"Не удалось восстановить сессию. Возможно, она была удалена.", nil)
 			}
-			var kb *telego.InlineKeyboardMarkup
-			if h.roster.IsAdmin(userID) {
-				kb = keys(row(button("панель", screenMain)))
-			}
 			return h.send(ctx, msg.Chat.ID,
 				"<b>Сессия восстановлена.</b>\n\nКонтекст загружен — продолжайте писать.",
-				kb)
+				nil)
 		}
 	}
 
-	// Regular /start — show greeting. Admins get a panel button;
-	// everyone else just gets text. Session management is handled by
-	// the reply-keyboard "Новый чат" button and /sessions command.
-	var keyboard *telego.InlineKeyboardMarkup
-	if h.roster.IsAdmin(userID) {
-		keyboard = keys(row(button("панель", screenMain)))
-	}
-	return h.send(ctx, msg.Chat.ID, h.greeting(userID), keyboard)
+	// Regular /start — show greeting. Panel is accessible via
+	// the "Меню" reply-keyboard button.
+	return h.send(ctx, msg.Chat.ID, h.greeting(userID), nil)
 }
 
 // screenContext renders a page that may need to call out to the network.
@@ -812,15 +795,15 @@ func (h *Handler) settingsScreen() (string, *telego.InlineKeyboardMarkup) {
 		row(button("модели", screenModels),
 			button("промпт", screenPresets)),
 		row(action(killLabel(v.PublicDailyLimit), killPublic)),
-		row(edit(fmt.Sprintf("📊 Лимит: %s", limitLabel(v.PublicDailyLimit)), knobLimit),
-			edit(fmt.Sprintf("📈 Всего: %s", limitLabel(v.GlobalDailyLimit)), knobGlobal)),
-		row(edit(fmt.Sprintf("🕓 Всплеск: %d", v.Burst), knobBurst),
-			edit(fmt.Sprintf("❌ Бан: %s", shortDuration(v.BanFor)), knobBan)),
-		row(edit(fmt.Sprintf("✍️ Токенов: %d", v.PublicMaxTokens), knobTokens),
-			edit(fmt.Sprintf("🔨 Символов: %d", v.PublicMaxRunes), knobRunes)),
-		row(edit(fmt.Sprintf("👤 Новые: %s", thresholdLabel(v.NewAccountThreshold)), knobNewAcc),
-			edit(fmt.Sprintf("⏰ Кэш: %s", cacheLabel(v.CacheTTL)), knobCache)),
-		row(edit(fmt.Sprintf("⚙️ Флаг -s: %s", onOffShort(v.RawFlagEnabled)), knobRaw)),
+		row(edit(fmt.Sprintf("Лимит: %s", limitLabel(v.PublicDailyLimit)), knobLimit),
+			edit(fmt.Sprintf("Всего: %s", limitLabel(v.GlobalDailyLimit)), knobGlobal)),
+		row(edit(fmt.Sprintf("Всплеск: %d", v.Burst), knobBurst),
+			edit(fmt.Sprintf("Бан: %s", shortDuration(v.BanFor)), knobBan)),
+		row(edit(fmt.Sprintf("Токенов: %d", v.PublicMaxTokens), knobTokens),
+			edit(fmt.Sprintf("Символов: %d", v.PublicMaxRunes), knobRunes)),
+		row(edit(fmt.Sprintf("Новые: %s", thresholdLabel(v.NewAccountThreshold)), knobNewAcc),
+			edit(fmt.Sprintf("Кэш: %s", cacheLabel(v.CacheTTL)), knobCache)),
+		row(edit(fmt.Sprintf("Флаг -s: %s", onOffShort(v.RawFlagEnabled)), knobRaw)),
 		row(backButton()),
 	)
 }
@@ -1056,11 +1039,14 @@ func (h *Handler) testAllModels(ctx context.Context) {
 func (h *Handler) helpScreen() (string, *telego.InlineKeyboardMarkup) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "<b>Справка</b>\n\n")
-	fmt.Fprintf(&b, "<b>В личке с ботом:</b>\n")
-	fmt.Fprintf(&b, "Кнопка «Новый чат» внизу — сбросить контекст, старый диалог сохранится\n")
+	fmt.Fprintf(&b, "<b>Кнопки внизу:</b>\n")
+	fmt.Fprintf(&b, "<b>Новый чат</b> — сбросить контекст, старый диалог сохранится\n")
+	fmt.Fprintf(&b, "<b>Продолжить</b> — список сохранённых сессий\n")
+	fmt.Fprintf(&b, "<b>Меню</b> — панель управления (для админов)\n\n")
+	fmt.Fprintf(&b, "<b>Команды:</b>\n")
 	fmt.Fprintf(&b, "<code>/sessions</code> — список сохранённых сессий\n")
 	fmt.Fprintf(&b, "<code>/clearcache</code> — сбросить кэш одинаковых вопросов\n\n")
-	fmt.Fprintf(&b, "<b>Команды доступа</b> — работают везде, где бота позвали:\n")
+	fmt.Fprintf(&b, "<b>Команды доступа</b> — работают везде:\n")
 	fmt.Fprintf(&b, "<code>/add id</code> — выдать доступ\n")
 	fmt.Fprintf(&b, "<code>/del id</code> — забрать\n")
 	fmt.Fprintf(&b, "<code>/list</code> — показать список\n\n")
@@ -1084,9 +1070,17 @@ func (h *Handler) send(ctx context.Context, chatID int64, text string, keyboard 
 	if keyboard != nil {
 		params.ReplyMarkup = keyboard
 	} else {
-		// No inline buttons — show the persistent "Новый чат" reply keyboard.
+		// No inline buttons — show the persistent reply keyboard.
 		params.ReplyMarkup = &telego.ReplyKeyboardMarkup{
-			Keyboard:       [][]telego.KeyboardButton{{telego.KeyboardButton{Text: "Новый чат"}}},
+			Keyboard: [][]telego.KeyboardButton{
+				{
+					telego.KeyboardButton{Text: "Новый чат"},
+					telego.KeyboardButton{Text: "Продолжить"},
+				},
+				{
+					telego.KeyboardButton{Text: "Меню"},
+				},
+			},
 			ResizeKeyboard: true,
 		}
 	}

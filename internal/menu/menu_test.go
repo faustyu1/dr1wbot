@@ -184,7 +184,7 @@ func TestStartSaysPrivateWhenPublicAccessIsOff(t *testing.T) {
 	if _, err := h.HandleMessage(context.Background(), privateMessage(999, "/start")); err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
 	}
-	if got := sender.sent[0].Text; !strings.Contains(got, "приватный") {
+	if got := sender.sent[0].Text; !strings.Contains(got, "Доступ по списку") {
 		t.Errorf("text = %q, want it to say the bot is private", got)
 	}
 }
