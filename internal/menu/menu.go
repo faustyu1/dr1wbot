@@ -389,26 +389,37 @@ func (h *Handler) HandleCallback(ctx context.Context, query telego.CallbackQuery
 
 	case name == actNewSession:
 		chatID := query.Message.GetChat().ID
-		var text string
-		if h.restorer != nil {
-			hash, err := h.restorer.Archive(query.From.ID)
-			if err != nil || hash == "" {
-				text = "История очищена. Начинайте новый диалог."
-			} else {
-				link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, hash)
-				text = fmt.Sprintf(
-					"<b>Сессия сохранена и очищена.</b>\n\n"+
-						"Старый диалог: <a href=\"%s\">открыть</a>\n\n"+
-						"Все сохранённые сессии: /sessions", link)
-			}
-		} else {
-			text = "Напишите /reset, чтобы сохранить текущую сессию и начать новую."
+		if h.restorer == nil {
+			_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
+				ChatID:             telego.ChatID{ID: chatID},
+				Text:               "Напишите /reset, чтобы начать новую.",
+				ParseMode:          telego.ModeHTML,
+				LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
+			})
+			return nil
+		}
+		hash, err := h.restorer.Archive(query.From.ID)
+		if err != nil || hash == "" {
+			_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
+				ChatID:             telego.ChatID{ID: chatID},
+				Text:               "<b>Контекст сброшен</b>",
+				ParseMode:          telego.ModeHTML,
+				LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
+			})
+			return nil
+		}
+		link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, hash)
+		kb := &telego.InlineKeyboardMarkup{
+			InlineKeyboard: [][]telego.InlineKeyboardButton{{
+				{Text: "Продолжить сессию", URL: link},
+			}},
 		}
 		_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
 			ChatID:             telego.ChatID{ID: chatID},
-			Text:               text,
+			Text:               "<b>Контекст сброшен</b>",
 			ParseMode:          telego.ModeHTML,
 			LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
+			ReplyMarkup:        kb,
 		})
 		return nil
 	}

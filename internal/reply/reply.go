@@ -1368,15 +1368,24 @@ func (h *Handler) handleReset(ctx context.Context, chatID, userID int64) error {
 	}
 	if hash == "" {
 		return h.sendPlain(ctx, chatID,
-			"История очищена. Начинайте новый диалог.")
+			"Контекст сброшен.")
 	}
 	link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, hash)
-	text := fmt.Sprintf(
-		"<b>Сессия сохранена и очищена.</b>\n\n"+
-			"Старый диалог: <a href=\"%s\">открыть</a>\n\n"+
-			"Все сохранённые сессии: /sessions",
-		link)
-	return h.sendPlain(ctx, chatID, text)
+	kb := &telego.InlineKeyboardMarkup{
+		InlineKeyboard: [][]telego.InlineKeyboardButton{{
+			{Text: "Продолжить сессию", URL: link},
+		}},
+	}
+	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), editTimeout)
+	defer cancel()
+	_, err = h.sender.SendMessage(sendCtx, &telego.SendMessageParams{
+		ChatID:             telego.ChatID{ID: chatID},
+		Text:               "<b>Контекст сброшен</b>",
+		ParseMode:          telego.ModeHTML,
+		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
+		ReplyMarkup:        kb,
+	})
+	return err
 }
 
 // handleClearCache empties the answer cache so the next identical question is

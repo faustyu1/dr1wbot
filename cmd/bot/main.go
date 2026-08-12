@@ -241,7 +241,7 @@ func run() error {
 				b.WriteString("\n")
 			}
 			resp, err := model.Complete(ctx, llm.Request{
-				System: "Сожми разговор в краткое содержание на русском, сохранив ключевые факты, имена, числа и контекст. Пиши одно-два предложения на каждое обсуждённое сообщение.",
+				System: "Сожми диалог в краткое саммари на русском. Сохраняй ключевые факты, имена, числа, решения и контекст. Пиши плотно — без воды, без повторов. Максимум 3-4 предложения.",
 				Prompt: b.String(),
 			})
 			if err != nil {
@@ -253,6 +253,8 @@ func run() error {
 			Dir:        sessionDir,
 			GitSync:    true,
 			Summariser: summariser,
+			MaxTurns:   10,
+			KeepTurns:  4,
 			Logger:     log,
 		})
 		if err != nil {
