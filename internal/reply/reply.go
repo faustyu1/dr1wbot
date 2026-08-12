@@ -676,9 +676,10 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 // answer can replace it in place.
 func (h *Handler) sendPlaceholder(ctx context.Context, chatID int64) (int, error) {
 	sent, err := h.sender.SendMessage(ctx, &telego.SendMessageParams{
-		ChatID:    telego.ChatID{ID: chatID},
-		Text:      tgemoji.Placeholder(),
-		ParseMode: telego.ModeHTML,
+		ChatID:      telego.ChatID{ID: chatID},
+		Text:        tgemoji.Placeholder(),
+		ParseMode:   telego.ModeHTML,
+		ReplyMarkup: replyKeyboard(),
 	})
 	if err == nil {
 		return sent.MessageID, nil
@@ -737,6 +738,7 @@ func (h *Handler) editChatText(parent context.Context, chatID int64, messageID i
 		Text:               html,
 		ParseMode:          telego.ModeHTML,
 		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
+		ReplyMarkup:        replyKeyboard(),
 	})
 	if sendErr != nil {
 		return errors.Join(err, plainErr, sendErr)
@@ -1404,15 +1406,19 @@ func (h *Handler) handleSessionsList(ctx context.Context, chatID, userID int64) 
 	entries := h.sessionArchiver.Archives(userID)
 	if len(entries) == 0 {
 		return h.sendPlain(ctx, chatID,
-			"У вас нет сохранённых сессий.\nИспользуйте /reset, чтобы сохранить текущую и начать новую.")
+			"Нет сохранённых сессий.\nНажмите «Новый чат» — текущий диалог сохранится автоматически.")
 	}
 
 	var b strings.Builder
 	b.WriteString("<b>Сохранённые сессии:</b>\n\n")
 	for i, e := range entries {
 		link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, e.Hash)
-		b.WriteString(fmt.Sprintf("%d. %s\n   %d сообщений — <a href=\"%s\">открыть</a>\n\n",
-			i+1, html.EscapeString(e.Preview), e.Turns, link))
+		date := ""
+		if t, err := time.Parse(time.RFC3339, e.Created); err == nil {
+			date = t.Format("2 Jan 15:04") + " — "
+		}
+		b.WriteString(fmt.Sprintf("%d. %s%s\n   %d сообщений — <a href=\"%s\">открыть</a>\n\n",
+			i+1, date, html.EscapeString(e.Preview), e.Turns, link))
 	}
 	return h.sendPlain(ctx, chatID, b.String())
 }

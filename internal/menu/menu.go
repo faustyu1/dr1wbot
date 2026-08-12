@@ -28,7 +28,6 @@ import (
 	"dr1wbot/internal/config"
 	"dr1wbot/internal/llm"
 	"dr1wbot/internal/quota"
-	"dr1wbot/internal/session"
 	"dr1wbot/internal/settings"
 	"dr1wbot/internal/tgemoji"
 )
@@ -68,9 +67,6 @@ type Roster interface {
 // the current conversation, returning a hash for a restore link.
 type SessionRestorer interface {
 	Restore(userID int64, hash string) error
-	HasActive(userID int64) bool
-	Archive(userID int64) (string, error)
-	Archives(userID int64) []session.ArchiveEntry
 }
 
 // Tuner is the settings the panel may change.
@@ -213,9 +209,6 @@ const (
 	testModels = "tmdl"
 	// selPresetPrefix marks a preset-selection button. The preset name follows.
 	selPresetPrefix = "psp:"
-	// Session buttons shown on /start.
-	actNewSession = "newSess"
-	actContinue   = "contSess"
 )
 
 // callersShown bounds the ban list. Telegram caps a keyboard's size, and a
@@ -378,47 +371,6 @@ func (h *Handler) HandleCallback(ctx context.Context, query telego.CallbackQuery
 		}
 		name = screenPresets
 
-	case name == actContinue:
-		_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
-			ChatID:             telego.ChatID{ID: query.Message.GetChat().ID},
-			Text:               "Просто продолжайте писать — я помню контекст нашей беседы.",
-			ParseMode:          telego.ModeHTML,
-			LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
-		})
-		return nil
-
-	case name == actNewSession:
-		chatID := query.Message.GetChat().ID
-		if h.restorer == nil {
-			_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
-				ChatID:             telego.ChatID{ID: chatID},
-				Text:               "Напишите /reset, чтобы начать новую.",
-				ParseMode:          telego.ModeHTML,
-				LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
-			})
-			return nil
-		}
-		hash, err := h.restorer.Archive(query.From.ID)
-		if err != nil || hash == "" {
-			_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
-				ChatID:             telego.ChatID{ID: chatID},
-				Text:               "Контекст сброшен.",
-				ParseMode:          telego.ModeHTML,
-				LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
-			})
-			return nil
-		}
-		link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, hash)
-		text := fmt.Sprintf(
-			"Контекст сброшен.\n\n<a href=\"%s\">продолжить старый</a>",
-			link)
-		_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
-			ChatID:             telego.ChatID{ID: chatID},
-			Text:               text,
-			ParseMode:          telego.ModeHTML,
-			LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
-		})
-		return nil
 	}
 
 	text, keyboard := h.screenContext(ctx, name, query.From.ID)
@@ -508,13 +460,16 @@ func (h *Handler) turn(knob string) error {
 func (h *Handler) greeting(userID int64) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "<b>Привет!</b>\n\n")
-	fmt.Fprintf(&b, "Я отвечаю в любом чате Telegram — позови меня по имени:\n\n")
-	fmt.Fprintf(&b, "<blockquote><code>@%s объясни, что такое CAP-теорема</code></blockquote>\n\n", h.botUsername)
-	fmt.Fprintf(&b, "Отвечу на вопрос, разберу картинку, продолжу разговор, если ответишь мне реплаем.\n\n")
+	if h.imagesOn {
+		fmt.Fprintf(&b, "Отвечу на вопрос, разберу картинку или продолжу разговор.\n\n")
+	} else {
+		fmt.Fprintf(&b, "Отвечу на вопрос или продолжу разговор.\n\n")
+	}
+	fmt.Fprintf(&b, "В личке пишу как собеседник — с памятью. Кнопка «Новый чат» внизу сбрасывает контекст. /sessions — сохранённые диалоги.\n\n")
 
 	switch {
 	case h.roster.IsAdmin(userID):
-		fmt.Fprintf(&b, "Ты админ: /admin открывает панель.")
+		fmt.Fprintf(&b, "Ты админ — кнопка «панель» ниже.")
 	case h.ration != nil && h.ration.Enabled():
 		used, limit := h.ration.Peek(userID)
 		fmt.Fprintf(&b, "Сегодня осталось <b>%d</b> из %d запросов. Счётчик обнуляется в полночь UTC.",
@@ -549,29 +504,12 @@ func (h *Handler) handleStart(ctx context.Context, msg telego.Message) error {
 		}
 	}
 
-	// Regular /start — show greeting with optional session buttons.
-	var rows [][]telego.InlineKeyboardButton
-	if h.roster.IsAdmin(userID) {
-		rows = append(rows, row(button("панель", screenMain)))
-	}
-	if h.restorer != nil {
-		var sessionRows []telego.InlineKeyboardButton
-		sessionRows = append(sessionRows, telego.InlineKeyboardButton{
-			Text:         "Новая сессия",
-			CallbackData: callbackPrefix + actNewSession,
-		})
-		if h.restorer.HasActive(userID) {
-			sessionRows = append(sessionRows, telego.InlineKeyboardButton{
-				Text:         "Продолжить",
-				CallbackData: callbackPrefix + actContinue,
-			})
-		}
-		rows = append(rows, sessionRows)
-	}
-
+	// Regular /start — show greeting. Admins get a panel button;
+	// everyone else just gets text. Session management is handled by
+	// the reply-keyboard "Новый чат" button and /sessions command.
 	var keyboard *telego.InlineKeyboardMarkup
-	if len(rows) > 0 {
-		keyboard = keys(rows...)
+	if h.roster.IsAdmin(userID) {
+		keyboard = keys(row(button("панель", screenMain)))
 	}
 	return h.send(ctx, msg.Chat.ID, h.greeting(userID), keyboard)
 }
@@ -1118,12 +1056,16 @@ func (h *Handler) testAllModels(ctx context.Context) {
 func (h *Handler) helpScreen() (string, *telego.InlineKeyboardMarkup) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "<b>Справка</b>\n\n")
-	fmt.Fprintf(&b, "<b>Команды</b> — работают в любом чате, где бота позвали:\n")
+	fmt.Fprintf(&b, "<b>В личке с ботом:</b>\n")
+	fmt.Fprintf(&b, "Кнопка «Новый чат» внизу — сбросить контекст, старый диалог сохранится\n")
+	fmt.Fprintf(&b, "<code>/sessions</code> — список сохранённых сессий\n")
+	fmt.Fprintf(&b, "<code>/clearcache</code> — сбросить кэш одинаковых вопросов\n\n")
+	fmt.Fprintf(&b, "<b>Команды доступа</b> — работают везде, где бота позвали:\n")
 	fmt.Fprintf(&b, "<code>/add id</code> — выдать доступ\n")
 	fmt.Fprintf(&b, "<code>/del id</code> — забрать\n")
 	fmt.Fprintf(&b, "<code>/list</code> — показать список\n\n")
-	fmt.Fprintf(&b, "<b>Флаг <code>-s</code></b> — первым словом в вопросе снимает домашний стиль ответа:\n")
-	fmt.Fprintf(&b, "<blockquote><code>@%s -s распиши подробно, ничего не сокращай</code></blockquote>\n\n",
+	fmt.Fprintf(&b, "<b>Флаг <code>-s</code></b> — первым словом в вопросе снимает домашний стиль:\n")
+	fmt.Fprintf(&b, "<blockquote><code>@%s -s распиши подробно</code></blockquote>\n\n",
 		h.botUsername)
 	fmt.Fprintf(&b, "Положительный id — человек, отрицательный — группа или канал.\n")
 
@@ -1139,11 +1081,14 @@ func (h *Handler) send(ctx context.Context, chatID int64, text string, keyboard 
 		ParseMode:          telego.ModeHTML,
 		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
 	}
-	// ReplyMarkup is an interface: assigning a nil *InlineKeyboardMarkup to it
-	// would produce a non-nil interface holding nil, and Telegram would be sent
-	// a keyboard field it cannot read.
 	if keyboard != nil {
 		params.ReplyMarkup = keyboard
+	} else {
+		// No inline buttons — show the persistent "Новый чат" reply keyboard.
+		params.ReplyMarkup = &telego.ReplyKeyboardMarkup{
+			Keyboard:       [][]telego.KeyboardButton{{telego.KeyboardButton{Text: "Новый чат"}}},
+			ResizeKeyboard: true,
+		}
 	}
 	_, err := h.sender.SendMessage(ctx, params)
 	if err == nil {

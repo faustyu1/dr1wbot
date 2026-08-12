@@ -153,8 +153,8 @@ func TestNonAdminGetsTheGreetingInsteadOfThePanel(t *testing.T) {
 	if strings.Contains(strings.ToLower(got.Text), "админ") && !strings.Contains(got.Text, "Привет") {
 		t.Errorf("text = %q, want the plain greeting", got.Text)
 	}
-	if got.ReplyMarkup != nil {
-		t.Error("greeting came with panel buttons for a non-admin")
+	if _, isInline := got.ReplyMarkup.(*telego.InlineKeyboardMarkup); isInline {
+		t.Error("greeting came with inline panel buttons for a non-admin")
 	}
 }
 
