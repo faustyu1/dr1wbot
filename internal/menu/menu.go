@@ -1111,7 +1111,13 @@ func (h *Handler) send(ctx context.Context, chatID int64, text string, keyboard 
 		params.ReplyMarkup = keyboard
 	}
 	_, err := h.sender.SendMessage(ctx, params)
-	if err == nil || !tgemoji.Has(text) {
+	if err == nil {
+		return nil
+	}
+	// Retry on custom-emoji rejection.  Telegram sometimes returns
+	// CUSTOM_EMOJI_INVALID even when our markup has been stripped, so we
+	// check both the error string and the content.
+	if !tgemoji.Has(text) && !strings.Contains(err.Error(), "CUSTOM_EMOJI_INVALID") {
 		return err
 	}
 
@@ -1132,7 +1138,10 @@ func (h *Handler) edit(ctx context.Context, chatID int64, messageID int, text st
 		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
 	}
 	_, err := h.sender.EditMessageText(ctx, params)
-	if err == nil || !tgemoji.Has(text) {
+	if err == nil {
+		return nil
+	}
+	if !tgemoji.Has(text) && !strings.Contains(err.Error(), "CUSTOM_EMOJI_INVALID") {
 		return err
 	}
 

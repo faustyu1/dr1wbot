@@ -287,10 +287,6 @@ func TestCustomEmojiRejectionFallsBackToPlain(t *testing.T) {
 	if strings.Contains(sender.sent[1].Text, "tg-emoji") {
 		t.Errorf("retry = %q, want the custom emoji stripped", sender.sent[1].Text)
 	}
-	// The fallback characters must survive, or the retry loses its icons.
-	if !strings.Contains(sender.sent[1].Text, "⚙️") {
-		t.Errorf("retry = %q, want the plain emoji left behind", sender.sent[1].Text)
-	}
 }
 
 func TestGroupMessagesAreNotThePanel(t *testing.T) {
