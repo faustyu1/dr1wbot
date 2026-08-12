@@ -63,10 +63,12 @@ type Roster interface {
 }
 
 // SessionRestorer loads an archived conversation back as the active one.
-// Used by /start deep links (restore_<hash>).
+// Used by /start deep links (restore_<hash>). Archive saves and clears
+// the current conversation, returning a hash for a restore link.
 type SessionRestorer interface {
 	Restore(userID int64, hash string) error
 	HasActive(userID int64) bool
+	Archive(userID int64) (string, error)
 }
 
 // Tuner is the settings the panel may change.
@@ -374,17 +376,34 @@ func (h *Handler) HandleCallback(ctx context.Context, query telego.CallbackQuery
 		}
 		name = screenPresets
 
-	case name == actNewSession || name == actContinue:
-		// These buttons don't open a screen — they send a message the user
-		// reads and then types in. We answer the callback and return early.
-		var text string
-		if name == actNewSession {
-			text = "🆕 Напишите /reset, чтобы сохранить текущую сессию и начать новую."
-		} else {
-			text = "▶️ Просто продолжайте писать — я помню контекст нашей беседы."
-		}
+	case name == actContinue:
 		_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
 			ChatID:             telego.ChatID{ID: query.Message.GetChat().ID},
+			Text:               "▶️ Просто продолжайте писать — я помню контекст нашей беседы.",
+			ParseMode:          telego.ModeHTML,
+			LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
+		})
+		return nil
+
+	case name == actNewSession:
+		chatID := query.Message.GetChat().ID
+		var text string
+		if h.restorer != nil {
+			hash, err := h.restorer.Archive(query.From.ID)
+			if err != nil || hash == "" {
+				text = "🧹 История очищена. Начинайте новый диалог."
+			} else {
+				link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, hash)
+				text = fmt.Sprintf(
+					"🧹 <b>Сессия сохранена и очищена.</b>\n\n"+
+						"Возвращайтесь к старому диалогу:\n%s\n\n"+
+						"Или командой /sessions — покажу все сохранённые сессии.", link)
+			}
+		} else {
+			text = "🆕 Напишите /reset, чтобы сохранить текущую сессию и начать новую."
+		}
+		_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
+			ChatID:             telego.ChatID{ID: chatID},
 			Text:               text,
 			ParseMode:          telego.ModeHTML,
 			LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
