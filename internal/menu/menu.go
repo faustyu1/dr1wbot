@@ -409,17 +409,14 @@ func (h *Handler) HandleCallback(ctx context.Context, query telego.CallbackQuery
 			return nil
 		}
 		link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, hash)
-		kb := &telego.InlineKeyboardMarkup{
-			InlineKeyboard: [][]telego.InlineKeyboardButton{{
-				{Text: "Продолжить сессию", URL: link},
-			}},
-		}
+		text := fmt.Sprintf(
+			"Контекст сброшен.\n\nСтарый диалог: <a href=\"%s\">продолжить</a>",
+			link)
 		_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
 			ChatID:             telego.ChatID{ID: chatID},
-			Text:               "Контекст сброшен.",
+			Text:               text,
 			ParseMode:          telego.ModeHTML,
 			LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
-			ReplyMarkup:        kb,
 		})
 		return nil
 	}
