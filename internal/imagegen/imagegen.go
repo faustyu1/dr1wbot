@@ -1,9 +1,9 @@
-// Package imagegen generates pictures through Google AI Studio's
-// OpenAI-compatible images endpoint.
+// Package imagegen generates pictures through the OpenAI-compatible images
+// endpoint (POST /images/generations).
 //
-// Google's image models have no free tier, so this path only works on a key
-// attached to a billed project — which is why it is off by default and why a
-// refusal for quota is reported as "no credits" rather than "try later".
+// Image generation is billed separately from chat, so this path only works on
+// a key attached to a billed project — which is why it is off by default and
+// why a refusal for quota is reported as "no credits" rather than "try later".
 //
 // The picture comes back as base64 in the response body rather than a URL,
 // which is why callers have to hand the decoded bytes to Telegram themselves.
@@ -33,6 +33,10 @@ type Generator interface {
 // distinguishing because the user-facing advice is completely different from a
 // refused prompt: enable billing, rather than rephrase.
 var ErrOutOfCredits = errors.New("out of credits")
+
+// errTransient marks a temporary server-side failure (5xx). Another key may
+// land on a healthier backend, so it is retried before giving up.
+var errTransient = errors.New("provider temporarily unavailable")
 
 // Client calls the images endpoint.
 type Client struct {
@@ -80,7 +84,7 @@ type request struct {
 	Model          string `json:"model"`
 	Prompt         string `json:"prompt"`
 	N              int    `json:"n"`
-	ResponseFormat string `json:"response_format"`
+	ResponseFormat string `json:"response_format,omitempty"`
 	Size           string `json:"size,omitempty"`
 }
 
@@ -104,11 +108,20 @@ func (c *Client) Generate(ctx context.Context, prompt string) ([]byte, error) {
 		return nil, fmt.Errorf("no api key configured")
 	}
 
+	// dall-e models default to returning a URL; response_format=b64_json asks
+	// for base64 so we don't have to download from an https link. GPT image
+	// models (gpt-image-1 etc.) always return base64 and ignore the field,
+	// so it's only sent for dall-e. The check covers both bare ("dall-e-3")
+	// and provider-prefixed ("openai/dall-e-3") names.
+	rf := ""
+	if strings.Contains(c.model, "dall-e-") {
+		rf = "b64_json"
+	}
 	payload, err := json.Marshal(request{
 		Model:          c.model,
 		Prompt:         prompt,
 		N:              1,
-		ResponseFormat: "b64_json",
+		ResponseFormat: rf,
 		Size:           c.size,
 	})
 	if err != nil {
@@ -123,6 +136,9 @@ func (c *Client) Generate(ctx context.Context, prompt string) ([]byte, error) {
 			return picture, nil
 		}
 		lastErr = err
+		if errors.Is(err, errTransient) {
+			continue // another key may land on a healthier backend
+		}
 		if !errors.Is(err, ErrOutOfCredits) {
 			return nil, err // a refused prompt is refused on every key
 		}
@@ -153,10 +169,17 @@ func (c *Client) call(ctx context.Context, apiKey string, payload []byte) ([]byt
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyLimit))
 		err := fmt.Errorf("image model returned %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
 		switch resp.StatusCode {
-		case http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests:
-			// On AI Studio all three mean the same thing in practice: this key
-			// has nothing to spend on pictures.
+		case http.StatusPaymentRequired, http.StatusForbidden, http.StatusTooManyRequests, http.StatusUnauthorized:
+			// 401 is per-key (a revoked or expired credential), so parking the
+			// key and advancing the cursor lets the rest of the pool keep
+			// generating instead of breaking on one dead key.
+			// The other three mean the same thing in practice: this key has
+			// nothing to spend on pictures.
 			return nil, errors.Join(ErrOutOfCredits, err)
+		case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			// A transient server error is worth another key, which may land on
+			// a healthier backend.
+			return nil, errors.Join(errTransient, err)
 		}
 		return nil, err
 	}
@@ -181,7 +204,7 @@ func (c *Client) call(ctx context.Context, apiKey string, payload []byte) ([]byt
 }
 
 // decodeDataURI unpacks a "data:image/png;base64,...." value. The endpoint is
-// asked for b64_json, but a compatibility layer is free to answer with a url.
+// asked for b64_json, but a provider is free to answer with a url instead.
 func decodeDataURI(uri string) ([]byte, error) {
 	if uri == "" {
 		return nil, fmt.Errorf("image model returned an empty image url")

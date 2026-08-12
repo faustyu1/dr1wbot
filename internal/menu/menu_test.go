@@ -80,8 +80,8 @@ func defaultStats() llm.Stats {
 	return llm.Stats{
 		Keys: keyring.Stats{Total: 3, Ready: 2, Parked: 1, NextReady: time.Now().Add(30 * time.Second)},
 		Models: []llm.ModelStat{
-			{Name: "gemini-3.6-flash", Answers: 7},
-			{Name: "gemini-3.5-flash", Answers: 2},
+			{Name: "openai/gpt-5.6-terra-pro", Answers: 7},
+			{Name: "openai/gpt-5.6-terra", Answers: 2},
 		},
 		Requests: 10,
 		QuotaOut: 1,
@@ -209,7 +209,7 @@ func TestButtonSwapsTheScreenInPlace(t *testing.T) {
 	if sender.edits[0].MessageID != 42 {
 		t.Errorf("edited message %d, want 42", sender.edits[0].MessageID)
 	}
-	if !strings.Contains(sender.edits[0].Text, "gemini-3.6-flash") {
+	if !strings.Contains(sender.edits[0].Text, "openai/gpt-5.6-terra-pro") {
 		t.Errorf("text = %q, want the model list on the limits screen", sender.edits[0].Text)
 	}
 	// Telegram spins the button until the query is answered.

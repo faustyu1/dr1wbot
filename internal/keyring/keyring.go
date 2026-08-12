@@ -1,6 +1,6 @@
 // Package keyring rotates a pool of API keys.
 //
-// Google AI Studio meters the free tier per key, so the way to survive a spent
+// Rate limits are metered per key, so the way to survive a spent
 // quota is to hold several keys and move to the next one when a request comes
 // back 429. A key that hit a limit is parked for a cooldown rather than
 // dropped: a per-minute limit heals on its own within a minute, and a daily one

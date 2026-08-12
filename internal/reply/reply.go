@@ -96,9 +96,8 @@ const (
 	msgBusy          = "⚠️ Сейчас слишком много запросов. Попробуй ещё раз через минуту."
 	msgTimeout       = "⚠️ Модель не ответила вовремя. Попробуй ещё раз."
 	msgFailed        = "⚠️ Не получилось получить ответ от модели."
-	msgRateLimited   = "⚠️ Лимиты Google AI Studio исчерпаны на всех ключах и моделях. " +
-		"Дневная квота free tier сбрасывается в полночь по тихоокеанскому времени (около 11:00 МСК). " +
-		"Снять лимит — добавить ещё ключ в GOOGLE_API_KEYS или включить биллинг."
+	msgRateLimited   = "⚠️ Лимиты исчерпаны на всех ключах и моделях. " +
+		"Снять лимит — добавить ещё ключ в OPENAI_API_KEYS или включить биллинг."
 	// msgCommandExpired is what an admin command's answer decays into. Guest
 	// answers are inline messages, and the Bot API cannot delete those — only
 	// edit them — so the closest thing to cleaning up after a command is
@@ -106,7 +105,7 @@ const (
 	msgCommandExpired = "✓"
 	msgImagesOff      = "⚠️ Генерация картинок выключена."
 	// msgDrawingIsPrivate keeps the paid path off the public allowance: a
-	// picture costs real money, a question costs free-tier quota.
+	// picture costs real money, a question costs quota.
 	msgDrawingIsPrivate = "⚠️ Рисовать могу только тем, кто есть в списке доступа."
 	msgTooLong          = "⚠️ Слишком длинный вопрос. Сократи — так я отвечу быстрее и точнее."
 	msgAlreadyBusy      = "⚠️ Я ещё думаю над твоим прошлым вопросом. Дождись ответа."
@@ -114,8 +113,8 @@ const (
 	msgImageFailed      = "⚠️ Не получилось нарисовать. Модель могла отказаться от такого запроса."
 	msgImageTimeout     = "⚠️ Картинка рисовалась слишком долго. Попробуй ещё раз."
 	msgImageRejected    = "⚠️ Картинка сгенерировалась, но Telegram её не принял."
-	msgNoCredits        = "⚠️ Нечем оплатить картинку: у картиночных моделей Google нет free tier. " +
-		"Нужен ключ от проекта с включённым биллингом — aistudio.google.com/apikey"
+	msgNoCredits        = "⚠️ Нечем оплатить картинку: генерация картинок платная. " +
+		"Нужен ключ от проекта с включённым биллингом."
 )
 
 // msgQuotaSpent tells a public user their day is over. The number is in the
@@ -391,6 +390,14 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 	question, raw := h.rawRequested(question, userID)
 	maxTokens, maxRunes := h.publicCaps()
 
+	// Claim the in-flight slot before charging quota, so a rejected double-tap
+	// costs nothing.
+	done, free := h.claim(userID)
+	if !free {
+		return h.sendPlain(ctx, msg.Chat.ID, msgAlreadyBusy)
+	}
+	defer done()
+
 	var budget int
 	if !privileged {
 		if maxRunes > 0 && len([]rune(question)) > maxRunes {
@@ -407,12 +414,6 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 		}
 		budget = maxTokens
 	}
-
-	done, free := h.claim(userID)
-	if !free {
-		return h.sendPlain(ctx, msg.Chat.ID, msgAlreadyBusy)
-	}
-	defer done()
 
 	// The same placeholder the guest path shows, for the same reason: an answer
 	// takes seconds, and silence for seconds reads as a broken bot.
@@ -597,6 +598,16 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 		return err
 	}
 
+	// One question at a time per person, checked before the allowance so a
+	// double-tap costs nothing — not a quota point, not a placeholder.
+	done, free := h.claim(userID)
+	if !free {
+		log.Info("caller already has a question in flight")
+		_, err := h.answer(ctx, msg.GuestQueryID, markdown(msgAlreadyBusy))
+		return err
+	}
+	defer done()
+
 	// The allowance is spent only once there is a real question to answer, so a
 	// command, an empty summon or a rejected one costs a stranger nothing.
 	if !privileged {
@@ -637,17 +648,6 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 		// the expensive half, and a stranger's question rarely needs an essay.
 		budget = maxTokens
 	}
-
-	// One question at a time per person, checked before the placeholder so a
-	// double-tap leaves no half-answered message behind.
-	done, free := h.claim(userID)
-	if !free {
-		log.Info("caller already has a question in flight")
-		_, err := h.answer(ctx, msg.GuestQueryID, markdown(msgAlreadyBusy))
-		return err
-	}
-	defer done()
-
 	inlineID, err := h.answer(ctx, msg.GuestQueryID, h.placeholder)
 	if err != nil {
 		return err // no placeholder means no message to edit; give up

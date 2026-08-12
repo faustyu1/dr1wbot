@@ -11,15 +11,13 @@ import (
 	"time"
 )
 
-// googleBaseURL is Google AI Studio's OpenAI-compatible endpoint. The native
-// Gemini API lives one level up and speaks its own dialect; this one takes the
+// defaultBaseURL is OpenRouter's OpenAI-compatible endpoint. It speaks the
 // same /chat/completions the rest of the code is written against.
-const googleBaseURL = "https://generativelanguage.googleapis.com/v1beta/openai"
+const defaultBaseURL = "https://openrouter.ai/api/v1"
 
-// defaultModels are tried in order. Both are free-tier on AI Studio, so the
-// fallback costs nothing but buys a second daily quota: when 3.6 is spent on
-// every key, the bot keeps answering on 3.5.
-var defaultModels = []string{"gemini-3.6-flash", "gemini-3.5-flash"}
+// defaultModels are tried in order. Terra goes first; when it is spent on every
+// key, the bot keeps answering on Luna — the same family, cheaper and faster.
+var defaultModels = []string{"openai/gpt-5.6-terra", "openai/gpt-5.6-luna"}
 
 // defaultSystemPrompt is tuned for a group chat: the bot is a participant in a
 // conversation, not a documentation generator. The length rule is the important
@@ -51,8 +49,8 @@ type Config struct {
 	BotToken string
 
 	BaseURL string
-	// APIKeys is the Google AI Studio key pool. Free-tier quota is per key, so
-	// several keys are several quotas.
+	// APIKeys is the OpenRouter key pool. Rate limits are per key, so several
+	// keys are several allowances.
 	APIKeys []string
 	// KeyCooldown is how long a key that answered 429 is skipped for.
 	KeyCooldown time.Duration
@@ -107,12 +105,12 @@ type Config struct {
 	MaxQueue int
 
 	// ImageModel is empty when picture generation is switched off, which is the
-	// default: no Google image model has a free tier, so drawing needs a key
-	// attached to a billed project.
+	// default: image generation is billed separately, so drawing needs a key
+	// attached to a project with billing enabled.
 	ImageModel string
 	// ImageBaseURL and ImageAPIKeys default to the chat endpoint's. They exist
-	// because the picture key need not be the chat key: the text models run on
-	// free keys, and only pictures need the billed one.
+	// because the picture key need not be the chat key: image generation is
+	// billed separately and may need a different key.
 	ImageBaseURL string
 	ImageAPIKeys []string
 	// ImageSize is the requested resolution, e.g. 1024x1024. Empty means the
@@ -157,14 +155,14 @@ func Load(getenv Getenv) (*Config, error) {
 		fail("TELEGRAM_BOT_TOKEN is required")
 	}
 
-	cfg.BaseURL = googleBaseURL
+	cfg.BaseURL = defaultBaseURL
 	if override := strings.TrimSpace(getenv("LLM_BASE_URL")); override != "" {
 		cfg.BaseURL = strings.TrimRight(override, "/")
 	}
 
-	cfg.APIKeys = list(getenv("GOOGLE_API_KEYS"))
+	cfg.APIKeys = list(getenv("OPENAI_API_KEYS"))
 	if len(cfg.APIKeys) == 0 {
-		fail("GOOGLE_API_KEYS is required: one or more Google AI Studio keys, comma separated")
+		fail("OPENAI_API_KEYS is required: one or more OpenRouter (or OpenAI-compatible) keys, comma separated")
 	}
 
 	cfg.Models = list(getenv("LLM_MODEL"))
@@ -190,13 +188,17 @@ func Load(getenv Getenv) (*Config, error) {
 
 	switch effort := strings.ToLower(strings.TrimSpace(getenv("LLM_REASONING_EFFORT"))); effort {
 	case "":
-		// Gemini 3 thinks by default and bills it against LLM_MAX_TOKENS, so a
+		// Some models think by default and bill it against LLM_MAX_TOKENS, so a
 		// group-chat answer can be crowded out by the reasoning it never shows.
 		cfg.ReasoningEffort = "low"
-	case "none", "low", "medium", "high":
+	case "none":
+		// "none" means omit the parameter entirely: the API does not accept
+		// the literal string "none", and an empty value is dropped by omitempty.
+		cfg.ReasoningEffort = ""
+	case "minimal", "low", "medium", "high", "xhigh", "max":
 		cfg.ReasoningEffort = effort
 	default:
-		fail("LLM_REASONING_EFFORT %q is not supported (want none, low, medium or high)", effort)
+		fail("LLM_REASONING_EFFORT %q is not supported (want none, minimal, low, medium, high, xhigh or max)", effort)
 	}
 
 	// The budget covers thinking as well as the answer, so it is set well above

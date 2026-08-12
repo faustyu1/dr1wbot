@@ -1611,3 +1611,61 @@ func TestDirectMessageBannedCallerGetsSilence(t *testing.T) {
 		t.Errorf("sent %+v, want nothing to a banned caller", sender.directs())
 	}
 }
+
+// TestADoubleTapDoesNotSpendTheAllowanceTwice is a regression test for a bug
+// where claim() was called after Judge(): a double-tap spent the daily
+// allowance before being told the caller was busy. The fix moved claim()
+// before Judge(), so the second tap costs no quota point.
+func TestADoubleTapDoesNotSpendTheAllowanceTwice(t *testing.T) {
+	sender := &fakeSender{}
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	model := &fakeModel{waitFn: func(context.Context) (string, error) {
+		<-release
+		return "ок", nil
+	}}
+	ration := &fakeRation{on: true, verdict: quota.Granted}
+	h := newHandler(sender, model, handlerOpts{
+		maxConcurrent: 4,
+		timeout:       time.Second,
+		access:        denyAll,
+		ration:        ration,
+	})
+
+	// First question blocks in the model.
+	busy := make(chan struct{})
+	go func() {
+		defer close(busy)
+		_ = h.HandleGuestMessage(context.Background(), guestMessage("@dr1wbot первый"))
+	}()
+
+	// Wait until the model is working so the second question overlaps.
+	deadline := time.After(2 * time.Second)
+	for model.callCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("first summon never reached the model")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	// Second question from the same person: must be rejected by claim(),
+	// before Judge() is ever called.
+	if err := h.HandleGuestMessage(context.Background(), guestMessage("@dr1wbot второй")); err != nil {
+		t.Fatalf("HandleGuestMessage() error = %v", err)
+	}
+
+	close(release)
+	<-busy
+
+	if len(ration.seen) != 1 {
+		t.Errorf("Judge called %d times, want 1: a rejected double-tap must not spend quota", len(ration.seen))
+	}
+}

@@ -490,3 +490,47 @@ func TestCallersIsCapped(t *testing.T) {
 		t.Errorf("Callers(8) returned %d", got)
 	}
 }
+
+// TestPrunedWarnsAreNotDoubleCountedAfterRollover is a regression test for a
+// bug where pruneWarns modified the backing slice in place but the result was
+// not written back. On the next call, the stale duplicates were re-counted,
+// inflating the warn total and causing a false permanent ban.
+func TestPrunedWarnsAreNotDoubleCountedAfterRollover(t *testing.T) {
+	c := &clock{at: time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)}
+	s, err := New(Options{
+		Limit: 100, Burst: 1, Window: time.Minute,
+		BanFor: time.Minute, WarnTTL: 30 * 24 * time.Hour, MaxWarns: 3,
+		Now: c.now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Earn two warns: one at T, one 29 days later.
+	s.Judge(111)
+	s.Judge(111)
+	s.Judge(111) // warn #1 at T
+	c.at = c.at.Add(29 * 24 * time.Hour)
+	s.Judge(111)
+	s.Judge(111)
+	s.Judge(111) // warn #2 at T+29d
+
+	// 31 days after the first warn (2 days after the second): warn #1 has
+	// expired (30-day TTL), warn #2 is still live. The next violation should
+	// see one live warn and issue a temporary ban, not a permanent one.
+	c.at = c.at.Add(2 * 24 * time.Hour)
+	s.Judge(111)
+	s.Judge(111)
+	s.Judge(111) // would-be warn #3
+
+	callers := s.Callers(10)
+	if len(callers) != 1 {
+		t.Fatalf("Callers() = %d entries, want 1", len(callers))
+	}
+	if callers[0].Forever {
+		t.Errorf("caller was permanently banned: the expired warn was double-counted by rollover")
+	}
+	if callers[0].Warns != 2 {
+		t.Errorf("Warns = %d, want 2 (one expired + the new one)", callers[0].Warns)
+	}
+}

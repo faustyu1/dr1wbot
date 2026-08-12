@@ -164,7 +164,7 @@ func run() error {
 		})
 	} else {
 		log.Warn("picture generation is off: set IMAGE_MODEL and IMAGE_STORAGE_CHAT_ID to enable it; " +
-			"note that no Google image model has a free tier, so the key needs billing enabled")
+			"note that image generation is billed separately, so the key needs billing enabled")
 	}
 
 	// One client serves both the answers and the admin menu's numbers, so what

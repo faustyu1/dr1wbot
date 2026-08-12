@@ -24,7 +24,7 @@ func newTestClient(t *testing.T, handler http.HandlerFunc) *Client {
 	return New(Options{
 		BaseURL: server.URL,
 		APIKeys: []string{"sk-test"},
-		Model:   "gemini-3.1-flash-image",
+		Model:   "openai/gpt-image-1",
 		Size:    "1024x1024",
 		Timeout: 5 * time.Second,
 	})
@@ -75,7 +75,7 @@ func TestGenerateReturnsDecodedBytes(t *testing.T) {
 	if gotAuth != "Bearer sk-test" {
 		t.Errorf("Authorization = %q, want a bearer token", gotAuth)
 	}
-	if body.Model != "gemini-3.1-flash-image" {
+	if body.Model != "openai/gpt-image-1" {
 		t.Errorf("model = %q, want the configured image model", body.Model)
 	}
 	if body.Prompt != "кот в скафандре" {
@@ -84,8 +84,8 @@ func TestGenerateReturnsDecodedBytes(t *testing.T) {
 	if body.N != 1 {
 		t.Errorf("n = %d, want a single picture", body.N)
 	}
-	if body.ResponseFormat != "b64_json" {
-		t.Errorf("response_format = %q, want the bytes inline", body.ResponseFormat)
+	if body.ResponseFormat != "" {
+		t.Errorf("response_format = %q, want empty: gpt-image models return base64 without it", body.ResponseFormat)
 	}
 	if body.Size != "1024x1024" {
 		t.Errorf("size = %q, want the configured size", body.Size)
@@ -120,7 +120,7 @@ func TestGenerateRotatesKeysWhenAKeyCannotPay(t *testing.T) {
 	client := New(Options{
 		BaseURL: server.URL,
 		APIKeys: []string{"free-key", "billed-key"},
-		Model:   "gemini-3.1-flash-image",
+		Model:   "openai/gpt-image-1",
 		Timeout: 5 * time.Second,
 	})
 
@@ -240,5 +240,128 @@ func TestGenerateRespectsContextDeadline(t *testing.T) {
 	// reply.Handler tells a timeout apart from a refusal via errors.Is.
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("error = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+}
+
+// TestGenerateRetriesAnotherKeyOn5xx verifies that a transient server error
+// (5xx) is retried on the next key, which may land on a healthier backend.
+func TestGenerateRetriesAnotherKeyOn5xx(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"error":"bad gateway"}`)
+			return
+		}
+		writeImage(t, w, base64.StdEncoding.EncodeToString(pngBytes))
+	}))
+	t.Cleanup(server.Close)
+
+	client := New(Options{
+		BaseURL: server.URL,
+		APIKeys: []string{"key-one", "key-two"},
+		Model:   "openai/gpt-image-1",
+		Timeout: 5 * time.Second,
+	})
+
+	got, err := client.Generate(context.Background(), "кот")
+	if err != nil {
+		t.Fatalf("Generate() error = %v, want a 502 retried on the next key", err)
+	}
+	if string(got) != string(pngBytes) {
+		t.Errorf("Generate() returned %q, want the decoded image", got)
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want the 5xx retried once on the second key", calls)
+	}
+}
+
+// TestGenerateRotatesToTheNextKeyOn401 verifies that a revoked or expired key
+// (HTTP 401) is parked and the next key is tried, instead of breaking image
+// generation entirely. This mirrors the same fix applied to llm.Client.
+func TestGenerateRotatesToTheNextKeyOn401(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Header.Get("Authorization") == "Bearer dead-key" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"message":"invalid api key"}}`)
+			return
+		}
+		writeImage(t, w, base64.StdEncoding.EncodeToString(pngBytes))
+	}))
+	t.Cleanup(server.Close)
+
+	client := New(Options{
+		BaseURL: server.URL,
+		APIKeys: []string{"dead-key", "good-key"},
+		Model:   "openai/gpt-image-1",
+		Timeout: 5 * time.Second,
+	})
+
+	got, err := client.Generate(context.Background(), "кот")
+	if err != nil {
+		t.Fatalf("Generate() error = %v, want the good key to draw after 401", err)
+	}
+	if string(got) != string(pngBytes) {
+		t.Errorf("Generate() returned %q, want the decoded image", got)
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want exactly two: 401 on dead-key then success on good-key", calls)
+	}
+}
+
+// TestGenerateSendsResponseFormatForDallE verifies that response_format=b64_json
+// is sent for dall-e models, which default to returning a URL.
+func TestGenerateSendsResponseFormatForDallE(t *testing.T) {
+	var body request
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		writeImage(t, w, base64.StdEncoding.EncodeToString(pngBytes))
+	}))
+	t.Cleanup(server.Close)
+
+	client := New(Options{
+		BaseURL: server.URL,
+		APIKeys: []string{"sk-test"},
+		Model:   "dall-e-3",
+		Timeout: 5 * time.Second,
+	})
+
+	_, err := client.Generate(context.Background(), "кот")
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if body.ResponseFormat != "b64_json" {
+		t.Errorf("response_format = %q, want b64_json for a dall-e model", body.ResponseFormat)
+	}
+}
+
+// TestGenerateSendsResponseFormatForPrefixedDallE verifies that the dall-e
+// detection works with provider-prefixed model names like "openai/dall-e-3".
+func TestGenerateSendsResponseFormatForPrefixedDallE(t *testing.T) {
+	var body request
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		writeImage(t, w, base64.StdEncoding.EncodeToString(pngBytes))
+	}))
+	t.Cleanup(server.Close)
+
+	client := New(Options{
+		BaseURL: server.URL,
+		APIKeys: []string{"sk-test"},
+		Model:   "openai/dall-e-3",
+		Timeout: 5 * time.Second,
+	})
+
+	_, err := client.Generate(context.Background(), "кот")
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if body.ResponseFormat != "b64_json" {
+		t.Errorf("response_format = %q, want b64_json for a prefixed dall-e model", body.ResponseFormat)
 	}
 }

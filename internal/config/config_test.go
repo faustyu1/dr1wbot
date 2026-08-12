@@ -12,7 +12,7 @@ import (
 func env(overrides map[string]string) Getenv {
 	vars := map[string]string{
 		"TELEGRAM_BOT_TOKEN": "123:abc",
-		"GOOGLE_API_KEYS":    "sk-test",
+		"OPENAI_API_KEYS":    "sk-test",
 	}
 	for k, v := range overrides {
 		if v == "" {
@@ -30,8 +30,8 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	if cfg.BaseURL != googleBaseURL {
-		t.Errorf("BaseURL = %q, want %q", cfg.BaseURL, googleBaseURL)
+	if cfg.BaseURL != defaultBaseURL {
+		t.Errorf("BaseURL = %q, want %q", cfg.BaseURL, defaultBaseURL)
 	}
 	if len(cfg.APIKeys) != 1 || cfg.APIKeys[0] != "sk-test" {
 		t.Errorf("APIKeys = %v, want the single configured key", cfg.APIKeys)
@@ -67,7 +67,7 @@ func TestLoadDefaults(t *testing.T) {
 
 func TestLoadParsesTheKeyPool(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
-		"GOOGLE_API_KEYS": " one , two,, one ,three,",
+		"OPENAI_API_KEYS": " one , two,, one ,three,",
 	}))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -81,33 +81,33 @@ func TestLoadParsesTheKeyPool(t *testing.T) {
 
 func TestLoadParsesTheModelList(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
-		"LLM_MODEL": "gemini-3.6-flash, gemini-3.5-flash",
+		"LLM_MODEL": "openai/gpt-5.6-terra, openai/gpt-5.6-luna",
 	}))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if got := strings.Join(cfg.Models, "|"); got != "gemini-3.6-flash|gemini-3.5-flash" {
+	if got := strings.Join(cfg.Models, "|"); got != "openai/gpt-5.6-terra|openai/gpt-5.6-luna" {
 		t.Errorf("Models = %v, want the fallback order preserved", cfg.Models)
 	}
 }
 
 func TestLoadImageEndpointDefaultsToTheChatOne(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
-		"IMAGE_MODEL":           "gemini-3.1-flash-image",
+		"IMAGE_MODEL":           "openai/gpt-image-1",
 		"IMAGE_STORAGE_CHAT_ID": "111",
 	}))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.ImageBaseURL != googleBaseURL || strings.Join(cfg.ImageAPIKeys, ",") != "sk-test" {
+	if cfg.ImageBaseURL != defaultBaseURL || strings.Join(cfg.ImageAPIKeys, ",") != "sk-test" {
 		t.Errorf("image endpoint = %q/%v, want the chat endpoint's %q/[sk-test]",
-			cfg.ImageBaseURL, cfg.ImageAPIKeys, googleBaseURL)
+			cfg.ImageBaseURL, cfg.ImageAPIKeys, defaultBaseURL)
 	}
 }
 
 func TestLoadImageEndpointOverride(t *testing.T) {
 	cfg, err := Load(env(map[string]string{
-		"IMAGE_MODEL":           "gemini-3-pro-image",
+		"IMAGE_MODEL":           "openai/gpt-image-1",
 		"IMAGE_STORAGE_CHAT_ID": "111",
 		"IMAGE_BASE_URL":        "https://example.test/v1/",
 		"IMAGE_API_KEYS":        "billed-key",
@@ -118,8 +118,8 @@ func TestLoadImageEndpointOverride(t *testing.T) {
 	if cfg.ImageBaseURL != "https://example.test/v1" {
 		t.Errorf("ImageBaseURL = %q, want the override without a trailing slash", cfg.ImageBaseURL)
 	}
-	// Pictures are paid on AI Studio, so the billed key stays separate from the
-	// free ones the chat models run on.
+	// Pictures are billed separately, so the billed key stays separate from the
+	// chat keys.
 	if strings.Join(cfg.ImageAPIKeys, ",") != "billed-key" {
 		t.Errorf("ImageAPIKeys = %v, want the override, not the chat keys", cfg.ImageAPIKeys)
 	}
@@ -195,13 +195,13 @@ func TestLoadErrors(t *testing.T) {
 		},
 		{
 			name:      "missing keys",
-			overrides: map[string]string{"GOOGLE_API_KEYS": ""},
-			wantIn:    "GOOGLE_API_KEYS is required",
+			overrides: map[string]string{"OPENAI_API_KEYS": ""},
+			wantIn:    "OPENAI_API_KEYS is required",
 		},
 		{
 			name:      "keys are only commas",
-			overrides: map[string]string{"GOOGLE_API_KEYS": " , ,"},
-			wantIn:    "GOOGLE_API_KEYS is required",
+			overrides: map[string]string{"OPENAI_API_KEYS": " , ,"},
+			wantIn:    "OPENAI_API_KEYS is required",
 		},
 		{
 			name:      "unknown reasoning effort",
@@ -216,7 +216,7 @@ func TestLoadErrors(t *testing.T) {
 		{
 			name: "image model without a storage chat",
 			overrides: map[string]string{
-				"IMAGE_MODEL": "gemini-3.1-flash-image",
+				"IMAGE_MODEL": "openai/gpt-image-1",
 			},
 			wantIn: "IMAGE_STORAGE_CHAT_ID is required",
 		},
@@ -263,14 +263,14 @@ func TestLoadErrors(t *testing.T) {
 func TestLoadReportsEveryProblemAtOnce(t *testing.T) {
 	_, err := Load(env(map[string]string{
 		"TELEGRAM_BOT_TOKEN": "",
-		"GOOGLE_API_KEYS":    "",
+		"OPENAI_API_KEYS":    "",
 		"LOG_LEVEL":          "trace",
 	}))
 	if err == nil {
 		t.Fatal("Load() error = nil, want an error")
 	}
 
-	for _, want := range []string{"TELEGRAM_BOT_TOKEN", "GOOGLE_API_KEYS", "LOG_LEVEL"} {
+	for _, want := range []string{"TELEGRAM_BOT_TOKEN", "OPENAI_API_KEYS", "LOG_LEVEL"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q is missing %q; all problems should be reported together", err, want)
 		}
@@ -318,4 +318,17 @@ func TestLoadRawSystemPrompt(t *testing.T) {
 			t.Errorf("RawSystemPrompt = %q, want it emptied so the flag is inert", cfg.RawSystemPrompt)
 		}
 	})
+}
+
+// TestReasoningEffortNoneOmitsParameter verifies that LLM_REASONING_EFFORT=none
+// results in an empty ReasoningEffort, so the parameter is omitted from the API
+// request rather than sent as the literal string "none" (which the API rejects).
+func TestReasoningEffortNoneOmitsParameter(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"LLM_REASONING_EFFORT": "none"}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ReasoningEffort != "" {
+		t.Errorf("ReasoningEffort = %q, want empty so it is omitted from the request", cfg.ReasoningEffort)
+	}
 }

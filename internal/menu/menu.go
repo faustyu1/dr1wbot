@@ -102,7 +102,7 @@ type Options struct {
 
 	BotUsername string
 	// ImagesOn is shown on the settings screen; drawing is off by default
-	// because Google's image models have no free tier.
+	// because image generation is billed separately.
 	ImagesOn bool
 	// StartedAt is when the process came up, which is the window every counter
 	// on the stats screen covers.
@@ -487,7 +487,7 @@ func (h *Handler) limitsScreen() (string, *telego.InlineKeyboardMarkup) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s <b>Лимиты и ключи</b>\n\n", tgemoji.Tag(tgemoji.IDChart, "📊"))
 
-	fmt.Fprintf(&b, "<b>Ключи Google AI Studio</b>\n")
+	fmt.Fprintf(&b, "<b>Ключи API</b>\n")
 	fmt.Fprintf(&b, "%s Свободны: <b>%d</b>\n", tgemoji.Tag(tgemoji.IDLockOpen, "🔓"), stats.Keys.Ready)
 	fmt.Fprintf(&b, "%s Остывают: <b>%d</b>\n", tgemoji.Tag(tgemoji.IDLockClosed, "🔒"), stats.Keys.Parked)
 	if !stats.Keys.NextReady.IsZero() {
@@ -510,7 +510,7 @@ func (h *Handler) limitsScreen() (string, *telego.InlineKeyboardMarkup) {
 			tgemoji.Tag(tgemoji.IDCross, "❌"), stats.QuotaOut)
 	}
 
-	fmt.Fprintf(&b, "\n%s <i>Остаток квоты Google через API не отдаёт — эндпоинта для этого нет. "+
+	fmt.Fprintf(&b, "\n%s <i>Остаток квоты через API не отдаёт — эндпоинта для этого нет. "+
 		"Здесь только то, что бот увидел сам с момента запуска. «Проверить ключи» дёргает список "+
 		"моделей каждым ключом: это бесплатно и показывает, какие ключи вообще живы.</i>",
 		tgemoji.Tag(tgemoji.IDInfo, "ℹ️"))
@@ -842,7 +842,7 @@ func onOffShort(on bool) string {
 }
 
 // escape makes provider text safe to drop into an HTML message. Error bodies
-// come from Google and can contain anything.
+// come from the model and can contain anything.
 func escape(s string) string {
 	return html.EscapeString(s)
 }

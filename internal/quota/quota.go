@@ -3,7 +3,7 @@
 // Guest mode makes the bot reachable from all of Telegram, so opening it to the
 // public means opening the API key with it. A per-user daily allowance is what
 // makes that survivable: a curious stranger costs a bounded number of requests,
-// and a determined one cannot drain the day's free tier on their own.
+// and a determined one cannot drain the day's quota on their own.
 //
 // The count is per user and resets at midnight UTC, matching nothing in
 // particular — the point is a predictable line in the day, not alignment with
@@ -430,12 +430,13 @@ func (s *Store) Callers(max int) []Caller {
 	now := s.now()
 	out := make([]Caller, 0, len(s.users))
 	for id, u := range s.users {
+		u.Warns = pruneWarns(u.Warns, now.Add(-s.warnTTL))
 		c := Caller{
 			ID:    id,
 			Used:  u.Used,
 			Limit: s.allowanceLocked(id),
 			Seen:  u.Seen,
-			Warns: len(pruneWarns(u.Warns, now.Add(-s.warnTTL))),
+			Warns: len(u.Warns),
 		}
 		if s.bannedLocked(u, now) {
 			c.Until, c.Forever = u.BannedUntil, u.Forever
@@ -542,7 +543,8 @@ func (s *Store) rolloverLocked() {
 
 	now := s.now()
 	for id, u := range s.users {
-		if !s.bannedLocked(u, now) && len(pruneWarns(u.Warns, now.Add(-s.warnTTL))) == 0 {
+		u.Warns = pruneWarns(u.Warns, now.Add(-s.warnTTL))
+		if !s.bannedLocked(u, now) && len(u.Warns) == 0 {
 			delete(s.users, id) // clean record, nothing left to remember
 			continue
 		}

@@ -76,7 +76,7 @@ func TestCompleteSendsAnOpenAICompatibleRequest(t *testing.T) {
 		t.Errorf("model = %q, want test-model", gotBody.Model)
 	}
 	if gotBody.MaxTokens != 256 {
-		t.Errorf("max_tokens = %d, want 256", gotBody.MaxTokens)
+		t.Errorf("max_completion_tokens = %d, want 256", gotBody.MaxTokens)
 	}
 	if gotBody.Stream {
 		t.Error("stream = true, want false: the bot edits once with the full answer")
@@ -403,7 +403,7 @@ func TestCompleteSendsReasoningEffort(t *testing.T) {
 	client := New(Options{
 		BaseURL:         server.URL,
 		APIKeys:         []string{"sk-test"},
-		Models:          []string{"gemini-3.6-flash"},
+		Models:          []string{"openai/gpt-5.6-terra"},
 		ReasoningEffort: "low",
 		Timeout:         time.Second,
 	})
@@ -457,5 +457,64 @@ func TestCompleteTruncatesLongErrorBodies(t *testing.T) {
 	}
 	if len(err.Error()) > errBodyLimit+128 {
 		t.Errorf("error is %d bytes, want the body snippet capped near %d", len(err.Error()), errBodyLimit)
+	}
+}
+
+// TestCompleteRotatesToTheNextKeyOn401 verifies that a 401 (revoked or expired
+// credential) is treated as a per-key failure: the key is parked and the next
+// one is tried, instead of bricking the bot on one dead key.
+func TestCompleteRotatesToTheNextKeyOn401(t *testing.T) {
+	var seen []attempt
+	client := newRotatingClient(t, func(w http.ResponseWriter, r *http.Request) {
+		got := record(t, r)
+		seen = append(seen, got)
+		if got.key == "key-one" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":{"message":"invalid api key"}}`)
+			return
+		}
+		writeAnswer(t, w, "ответ")
+	})
+
+	got, err := client.Complete(context.Background(), Request{Prompt: "вопрос"})
+	if err != nil {
+		t.Fatalf("Complete() error = %v, want the second key to save the answer", err)
+	}
+	if got != "ответ" {
+		t.Errorf("Complete() = %q, want the answer from the second key", got)
+	}
+	if len(seen) != 2 || seen[0].key != "key-one" || seen[1].key != "key-two" {
+		t.Fatalf("attempts = %+v, want key-one then key-two", seen)
+	}
+
+	// A dead key stays parked just like a rate-limited one.
+	seen = nil
+	if _, err := client.Complete(context.Background(), Request{Prompt: "ещё"}); err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if len(seen) != 1 || seen[0].key != "key-two" {
+		t.Errorf("attempts = %+v, want the next request to go straight to key-two", seen)
+	}
+}
+
+// TestCompleteReportsRefusalAsAnError verifies that when the model returns an
+// empty content but a non-empty refusal, the error names the refusal so the
+// caller can tell it apart from other empty-answer causes.
+func TestCompleteReportsRefusalAsAnError(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{
+				"message":       map[string]string{"role": "assistant", "content": "", "refusal": "I cannot help with that"},
+				"finish_reason": "stop",
+			}},
+		})
+	})
+
+	_, err := client.Complete(context.Background(), Request{Prompt: "вопрос"})
+	if err == nil {
+		t.Fatal("Complete() error = nil, want a refusal error")
+	}
+	if !strings.Contains(err.Error(), "refused") {
+		t.Errorf("error = %q, want it to mention the refusal", err)
 	}
 }

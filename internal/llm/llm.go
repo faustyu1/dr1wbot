@@ -1,7 +1,7 @@
-// Package llm talks to Google AI Studio through its OpenAI-compatible chat
-// completions endpoint.
+// Package llm talks to an OpenAI-compatible chat completions endpoint (by
+// default OpenRouter) through its chat completions API.
 //
-// Two things shape this client. Free-tier quota is metered per key, so it holds
+// Two things shape this client. Rate limits are metered per key, so it holds
 // a ring of keys and moves to the next one on 429. And a quota is also metered
 // per model, so it holds a list of models: when every key is spent on the first
 // model, the whole ring is tried again on the next one before giving up.
@@ -91,9 +91,9 @@ type Options struct {
 	Models       []string
 	SystemPrompt string
 	MaxTokens    int
-	// ReasoningEffort maps to Gemini's thinking budget. Empty leaves it to the
-	// provider. Thinking tokens are billed against MaxTokens, so a low effort is
-	// what keeps a chat-sized budget from being spent before the answer starts.
+	// ReasoningEffort maps to the model's thinking budget. Empty leaves it to
+	// the provider. Thinking tokens are billed against MaxTokens, so a low effort
+	// is what keeps a chat-sized budget from being spent before the answer starts.
 	ReasoningEffort string
 	Timeout         time.Duration
 	HTTPClient      *http.Client // optional; tests inject their own
@@ -128,7 +128,7 @@ type ModelStat struct {
 }
 
 // Stats is what the admin menu shows. Everything in it is observed, not asked
-// for: Google exposes no endpoint for "how much of my free tier is left".
+// for: OpenRouter exposes no endpoint for "how much of my quota is left".
 type Stats struct {
 	Keys keyring.Stats
 	// Models are in fallback order, so the first one carrying no answers while
@@ -218,7 +218,7 @@ func userContent(prompt string, images [][]byte) any {
 type completionRequest struct {
 	Model           string    `json:"model"`
 	Messages        []message `json:"messages"`
-	MaxTokens       int       `json:"max_tokens,omitempty"`
+	MaxTokens       int       `json:"max_completion_tokens,omitempty"`
 	ReasoningEffort string    `json:"reasoning_effort,omitempty"`
 	Stream          bool      `json:"stream"`
 }
@@ -227,6 +227,7 @@ type completionResponse struct {
 	Choices []struct {
 		Message struct {
 			Content string `json:"content"`
+			Refusal string `json:"refusal"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -327,14 +328,14 @@ type KeyProbe struct {
 	// Models is how many models the key may use. Zero with no error means the
 	// key works but has nothing enabled.
 	Models int
-	// Err is set when the probe failed, and its message is what Google said.
+	// Err is set when the probe failed, and its message is what the provider said.
 	Err error
 }
 
-// Probe asks every key what models it can reach. Google publishes no endpoint
-// for "how much of my quota is left" — the models list is the closest thing to
-// a health check that exists, and it is free, so it answers the only question
-// the list can: which keys are actually alive.
+// Probe asks every key what models it can reach. The provider publishes no
+// endpoint for "how much of my quota is left" — the models list is the closest
+// thing to a health check that exists, and it is free, so it answers the only
+// question the list can: which keys are actually alive.
 func (c *Client) Probe(ctx context.Context) []KeyProbe {
 	leases := c.keys.Lease()
 	out := make([]KeyProbe, 0, len(leases))
@@ -414,9 +415,12 @@ func (c *Client) call(ctx context.Context, model, apiKey string, payload []byte)
 
 	answer := strings.TrimSpace(parsed.Choices[0].Message.Content)
 	if answer == "" {
+		if refusal := strings.TrimSpace(parsed.Choices[0].Message.Refusal); refusal != "" {
+			return "", fmt.Errorf("model refused: %s", refusal)
+		}
 		if parsed.Choices[0].FinishReason == "length" {
-			// Gemini bills thinking against max_tokens, so a budget that is too
-			// small is spent before a single word of the answer is emitted.
+			// Some models bill thinking against max_completion_tokens, so a budget
+			// that is too small is spent before a single word of the answer is emitted.
 			return "", fmt.Errorf("llm spent the whole token budget on thinking and returned nothing: raise LLM_MAX_TOKENS")
 		}
 		return "", fmt.Errorf("llm returned an empty answer")
@@ -430,7 +434,10 @@ func statusError(model string, resp *http.Response) error {
 	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyLimit))
 	err := fmt.Errorf("llm %s returned %s: %s", model, resp.Status, strings.TrimSpace(string(snippet)))
 	switch resp.StatusCode {
-	case http.StatusTooManyRequests, http.StatusPaymentRequired:
+	case http.StatusTooManyRequests, http.StatusPaymentRequired, http.StatusUnauthorized:
+		// 401 is per-key (a revoked or expired credential), not per-request,
+		// so parking the key and advancing the cursor lets the rest of the
+		// pool keep answering instead of bricking the bot on one dead key.
 		return errors.Join(ErrRateLimited, err)
 	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return errors.Join(errOverloaded, err)
