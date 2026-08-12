@@ -379,7 +379,7 @@ func (h *Handler) HandleCallback(ctx context.Context, query telego.CallbackQuery
 	case name == actContinue:
 		_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
 			ChatID:             telego.ChatID{ID: query.Message.GetChat().ID},
-			Text:               "▶️ Просто продолжайте писать — я помню контекст нашей беседы.",
+			Text:               "Просто продолжайте писать — я помню контекст нашей беседы.",
 			ParseMode:          telego.ModeHTML,
 			LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
 		})
@@ -543,12 +543,12 @@ func (h *Handler) handleStart(ctx context.Context, msg telego.Message) error {
 	if h.restorer != nil {
 		var sessionRows []telego.InlineKeyboardButton
 		sessionRows = append(sessionRows, telego.InlineKeyboardButton{
-			Text:         "🆕 Новая сессия",
+			Text:         "Новая сессия",
 			CallbackData: callbackPrefix + actNewSession,
 		})
 		if h.restorer.HasActive(userID) {
 			sessionRows = append(sessionRows, telego.InlineKeyboardButton{
-				Text:         "▶️ Продолжить",
+				Text:         "Продолжить",
 				CallbackData: callbackPrefix + actContinue,
 			})
 		}
@@ -594,11 +594,11 @@ func (h *Handler) callersScreen() (string, *telego.InlineKeyboardMarkup) {
 		case c.Forever:
 			fmt.Fprintf(&b, "<code>%d</code> — <b>бан навсегда</b>, варнов %d\n",
 				c.ID, c.Warns)
-			rows = append(rows, row(action(fmt.Sprintf("✅ Разбанить %d", c.ID), pardonPrefix+idText(c.ID))))
+			rows = append(rows, row(action(fmt.Sprintf("Разбанить %d", c.ID), pardonPrefix+idText(c.ID))))
 		case !c.Until.IsZero():
 			fmt.Fprintf(&b, "<code>%d</code> — бан ещё <b>%s</b>, варнов %d\n",
 				c.ID, shortDuration(time.Until(c.Until)), c.Warns)
-			rows = append(rows, row(action(fmt.Sprintf("✅ Разбанить %d", c.ID), pardonPrefix+idText(c.ID))))
+			rows = append(rows, row(action(fmt.Sprintf("Разбанить %d", c.ID), pardonPrefix+idText(c.ID))))
 		default:
 			fmt.Fprintf(&b, "<code>%d</code> — %d из %d",
 				c.ID, c.Used, c.Limit)
@@ -606,7 +606,7 @@ func (h *Handler) callersScreen() (string, *telego.InlineKeyboardMarkup) {
 				fmt.Fprintf(&b, ", варнов %d", c.Warns)
 			}
 			fmt.Fprintf(&b, "\n")
-			rows = append(rows, row(action(fmt.Sprintf("🚫 Забанить %d", c.ID), banPrefix+idText(c.ID))))
+			rows = append(rows, row(action(fmt.Sprintf("Забанить %d", c.ID), banPrefix+idText(c.ID))))
 		}
 	}
 
@@ -975,14 +975,14 @@ func (h *Handler) modelsScreen() (string, *telego.InlineKeyboardMarkup) {
 					break
 				}
 			}
-			label = fmt.Sprintf("✅ %d│ %s", order, m)
+			label = fmt.Sprintf("[%d] %s", order, m)
 		} else {
-			label = fmt.Sprintf("⚪️ │ %s", m)
+			label = "    " + m
 		}
 		// Mark dead models.
 		if results != nil {
 			if ok, found := results[m]; found && !ok {
-				label = "❌ " + label
+				label = "(мёртв) " + label
 			}
 		}
 		rows = append(rows, row(action(label, selModelPrefix+m)))
@@ -1007,9 +1007,9 @@ func (h *Handler) presetsScreen(userID int64) (string, *telego.InlineKeyboardMar
 	}
 
 	for _, p := range presets {
-		mark := "⚪️"
+		mark := "○"
 		if p.Name == active {
-			mark = "✅"
+			mark = "●"
 		}
 		fmt.Fprintf(&b, "%s <b>%s</b> — %s\n", mark, p.Name, p.Desc)
 	}
@@ -1018,9 +1018,11 @@ func (h *Handler) presetsScreen(userID int64) (string, *telego.InlineKeyboardMar
 
 	rows := make([][]telego.InlineKeyboardButton, 0, len(presets)+1)
 	for _, p := range presets {
-		label := p.Desc
+		var label string
 		if p.Name == active {
-			label = "✅ " + label
+			label = p.Desc + " ●"
+		} else {
+			label = p.Desc
 		}
 		rows = append(rows, row(action(label, selPresetPrefix+p.Name)))
 	}
