@@ -132,6 +132,10 @@ const (
 	msgImageRejected    = "⚠️ Картинка сгенерировалась, но Telegram её не принял."
 	msgNoCredits        = "⚠️ Нечем оплатить картинку: генерация картинок платная. " +
 		"Нужен ключ от проекта с включённым биллингом."
+
+	// cmdNewChat is the bottom keyboard button. Pressing it sends this exact
+	// text as a message; HandleDirectMessage maps it to /reset.
+	cmdNewChat = "Новый чат"
 )
 
 // msgQuotaSpent tells a public user their day is over. The number is in the
@@ -555,7 +559,7 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 		cmd = cmd[:at]
 	}
 	switch cmd {
-	case "/reset":
+	case "/reset", cmdNewChat:
 		if h.sessionArchiver != nil {
 			return h.handleReset(ctx, msg.Chat.ID, userID)
 		}
@@ -671,9 +675,10 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 // answer can replace it in place.
 func (h *Handler) sendPlaceholder(ctx context.Context, chatID int64) (int, error) {
 	sent, err := h.sender.SendMessage(ctx, &telego.SendMessageParams{
-		ChatID:    telego.ChatID{ID: chatID},
-		Text:      tgemoji.Placeholder(),
-		ParseMode: telego.ModeHTML,
+		ChatID:      telego.ChatID{ID: chatID},
+		Text:        tgemoji.Placeholder(),
+		ParseMode:   telego.ModeHTML,
+		ReplyMarkup: replyKeyboard(),
 	})
 	if err == nil {
 		return sent.MessageID, nil
@@ -726,6 +731,15 @@ func (h *Handler) editChatText(parent context.Context, chatID int64, messageID i
 	return nil
 }
 
+// replyKeyboard is the persistent bottom-of-chat keyboard shown in private
+// chats. It lets the user start a new conversation without typing /reset.
+func replyKeyboard() *telego.ReplyKeyboardMarkup {
+	return &telego.ReplyKeyboardMarkup{
+		Keyboard:       [][]telego.KeyboardButton{{telego.KeyboardButton{Text: cmdNewChat}}},
+		ResizeKeyboard: true,
+	}
+}
+
 // sendPlain posts a short notice into a private chat — a refusal or a limit,
 // never a model answer. Those are plain sentences by design, so they need no
 // formatting and no placeholder to replace.
@@ -737,6 +751,7 @@ func (h *Handler) sendPlain(ctx context.Context, chatID int64, text string) erro
 		ChatID:             telego.ChatID{ID: chatID},
 		Text:               text,
 		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
+		ReplyMarkup:        replyKeyboard(),
 	})
 	return err
 }

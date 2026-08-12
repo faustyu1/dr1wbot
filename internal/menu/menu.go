@@ -28,6 +28,7 @@ import (
 	"dr1wbot/internal/config"
 	"dr1wbot/internal/llm"
 	"dr1wbot/internal/quota"
+	"dr1wbot/internal/session"
 	"dr1wbot/internal/settings"
 	"dr1wbot/internal/tgemoji"
 )
@@ -69,6 +70,7 @@ type SessionRestorer interface {
 	Restore(userID int64, hash string) error
 	HasActive(userID int64) bool
 	Archive(userID int64) (string, error)
+	Archives(userID int64) []session.ArchiveEntry
 }
 
 // Tuner is the settings the panel may change.
