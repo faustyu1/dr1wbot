@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"html"
 	"log/slog"
 	"strings"
 	"sync"
@@ -750,6 +751,7 @@ func (h *Handler) sendPlain(ctx context.Context, chatID int64, text string) erro
 	_, err := h.sender.SendMessage(sendCtx, &telego.SendMessageParams{
 		ChatID:             telego.ChatID{ID: chatID},
 		Text:               text,
+		ParseMode:          telego.ModeHTML,
 		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
 		ReplyMarkup:        replyKeyboard(),
 	})
@@ -1401,7 +1403,7 @@ func (h *Handler) handleSessionsList(ctx context.Context, chatID, userID int64) 
 	for i, e := range entries {
 		link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, e.Hash)
 		b.WriteString(fmt.Sprintf("%d. %s\n   %d сообщений — <a href=\"%s\">открыть</a>\n\n",
-			i+1, e.Preview, e.Turns, link))
+			i+1, html.EscapeString(e.Preview), e.Turns, link))
 	}
 	return h.sendPlain(ctx, chatID, b.String())
 }
