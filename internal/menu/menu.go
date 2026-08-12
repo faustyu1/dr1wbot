@@ -391,16 +391,16 @@ func (h *Handler) HandleCallback(ctx context.Context, query telego.CallbackQuery
 		if h.restorer != nil {
 			hash, err := h.restorer.Archive(query.From.ID)
 			if err != nil || hash == "" {
-				text = "🧹 История очищена. Начинайте новый диалог."
+				text = "История очищена. Начинайте новый диалог."
 			} else {
 				link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, hash)
 				text = fmt.Sprintf(
-					"🧹 <b>Сессия сохранена и очищена.</b>\n\n"+
-						"Возвращайтесь к старому диалогу:\n%s\n\n"+
-						"Или командой /sessions — покажу все сохранённые сессии.", link)
+					"<b>Сессия сохранена и очищена.</b>\n\n"+
+						"Старый диалог: <a href=\"%s\">открыть</a>\n\n"+
+						"Все сохранённые сессии: /sessions", link)
 			}
 		} else {
-			text = "🆕 Напишите /reset, чтобы сохранить текущую сессию и начать новую."
+			text = "Напишите /reset, чтобы сохранить текущую сессию и начать новую."
 		}
 		_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
 			ChatID:             telego.ChatID{ID: chatID},
@@ -527,11 +527,15 @@ func (h *Handler) handleStart(ctx context.Context, msg telego.Message) error {
 			if err := h.restorer.Restore(userID, hash); err != nil {
 				h.log.Warn("restore failed", "err", err, "user_id", userID)
 				return h.send(ctx, msg.Chat.ID,
-					"⚠️ Не удалось восстановить сессию. Возможно, она была удалена.", nil)
+					"Не удалось восстановить сессию. Возможно, она была удалена.", nil)
+			}
+			var kb *telego.InlineKeyboardMarkup
+			if h.roster.IsAdmin(userID) {
+				kb = keys(row(button("панель", screenMain)))
 			}
 			return h.send(ctx, msg.Chat.ID,
-				"✅ <b>Сессия восстановлена.</b>\n\nПродолжаем с того места, где остановились.",
-				nil)
+				"<b>Сессия восстановлена.</b>\n\nКонтекст загружен — продолжайте писать.",
+				kb)
 		}
 	}
 

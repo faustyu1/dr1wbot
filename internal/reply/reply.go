@@ -1347,17 +1347,17 @@ func (h *Handler) handleReset(ctx context.Context, chatID, userID int64) error {
 	hash, err := h.sessionArchiver.Archive(userID)
 	if err != nil {
 		h.log.Warn("archive failed", "err", err, "user_id", userID)
-		return h.sendPlain(ctx, chatID, "⚠️ Не удалось сохранить сессию. Попробуйте ещё раз.")
+		return h.sendPlain(ctx, chatID, "Не удалось сохранить сессию. Попробуйте ещё раз.")
 	}
 	if hash == "" {
 		return h.sendPlain(ctx, chatID,
-			"🧹 История очищена. Начинайте новый диалог — я ничего не помню из прошлого.")
+			"История очищена. Начинайте новый диалог.")
 	}
 	link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, hash)
 	text := fmt.Sprintf(
-		"🧹 <b>Сессия сохранена и очищена.</b>\n\n"+
-			"Возвращайтесь к старому диалогу в любой момент:\n%s\n\n"+
-			"Или командой /sessions — покажу все сохранённые сессии.",
+		"<b>Сессия сохранена и очищена.</b>\n\n"+
+			"Старый диалог: <a href=\"%s\">открыть</a>\n\n"+
+			"Все сохранённые сессии: /sessions",
 		link)
 	return h.sendPlain(ctx, chatID, text)
 }
@@ -1369,7 +1369,7 @@ func (h *Handler) handleClearCache(ctx context.Context, chatID int64) error {
 		h.cache.Clear()
 	}
 	return h.sendPlain(ctx, chatID,
-		"🗑 Кэш ответов сброшен. Теперь каждый вопрос идёт к модели заново.")
+		"Кэш ответов сброшен. Теперь каждый вопрос идёт к модели заново.")
 }
 
 // handleSessionsList shows the user their archived conversations with restore
@@ -1378,14 +1378,14 @@ func (h *Handler) handleSessionsList(ctx context.Context, chatID, userID int64) 
 	entries := h.sessionArchiver.Archives(userID)
 	if len(entries) == 0 {
 		return h.sendPlain(ctx, chatID,
-			"📂 У вас нет сохранённых сессий.\nИспользуйте /reset, чтобы сохранить текущую и начать новую.")
+			"У вас нет сохранённых сессий.\nИспользуйте /reset, чтобы сохранить текущую и начать новую.")
 	}
 
 	var b strings.Builder
-	b.WriteString("📂 <b>Сохранённые сессии:</b>\n\n")
+	b.WriteString("<b>Сохранённые сессии:</b>\n\n")
 	for i, e := range entries {
 		link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, e.Hash)
-		b.WriteString(fmt.Sprintf("%d. %s\n   %d сообщений\n   %s\n\n",
+		b.WriteString(fmt.Sprintf("%d. %s\n   %d сообщений — <a href=\"%s\">открыть</a>\n\n",
 			i+1, e.Preview, e.Turns, link))
 	}
 	return h.sendPlain(ctx, chatID, b.String())
