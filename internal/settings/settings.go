@@ -51,6 +51,9 @@ type Values struct {
 	// CacheTTL is how long an answer to an identical question is reused. Zero
 	// disables the cache.
 	CacheTTL time.Duration `json:"cache_ttl"`
+	// UserPresets maps userID → preset name for per-user system prompts.
+	// An entry missing from the map means "use the global default".
+	UserPresets map[int64]string `json:"user_presets,omitempty"`
 }
 
 // Store keeps Values on disk. It is safe for concurrent use.
@@ -137,6 +140,32 @@ func (s *Store) saveLocked() error {
 		return fmt.Errorf("replace settings %s: %w", s.path, err)
 	}
 	return nil
+}
+
+// UserPreset returns the system-prompt preset name for a user, or "" if the
+// user has no custom preset (meaning: use the global default).
+func (s *Store) UserPreset(userID int64) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.values.UserPresets == nil {
+		return ""
+	}
+	return s.values.UserPresets[userID]
+}
+
+// SetUserPreset sets or clears the system-prompt preset for a user. An empty
+// name removes the entry, reverting to the global default.
+func (s *Store) SetUserPreset(userID int64, name string) (Values, error) {
+	return s.Update(func(v *Values) {
+		if v.UserPresets == nil {
+			v.UserPresets = make(map[int64]string)
+		}
+		if name == "" {
+			delete(v.UserPresets, userID)
+		} else {
+			v.UserPresets[userID] = name
+		}
+	})
 }
 
 // Cycle steps through a fixed list of choices, wrapping at the end. It is what

@@ -67,20 +67,33 @@ func StripMention(text string, entities []Entity, botUsername string) string {
 // somewhere in the middle is still an ordinary question.
 const RawFlag = "-s"
 
+// DivkaFlag switches to the Дианочка persona for one question. Available to
+// everyone, not just admins — it is a fun mode, not a privileged override.
+const DivkaFlag = "-d"
+
 // StripRawFlag removes a leading RawFlag and reports whether it was there. The
 // caller decides who is allowed to use it; for everyone else the text comes
 // back untouched and reads as part of the question.
 func StripRawFlag(text string) (rest string, raw bool) {
+	return stripFlag(text, RawFlag)
+}
+
+// StripDivkaFlag removes a leading DivkaFlag and reports whether it was there.
+func StripDivkaFlag(text string) (rest string, divka bool) {
+	return stripFlag(text, DivkaFlag)
+}
+
+// stripFlag is the shared implementation: find a leading "-x" token followed by
+// whitespace, strip it, and report whether it was present.
+func stripFlag(text, flag string) (rest string, found bool) {
 	trimmed := strings.TrimSpace(text)
-	if trimmed == RawFlag {
+	if trimmed == flag {
 		return "", true
 	}
-	after, found := strings.CutPrefix(trimmed, RawFlag)
-	if !found {
+	after, ok := strings.CutPrefix(trimmed, flag)
+	if !ok {
 		return trimmed, false
 	}
-	// Require whitespace after the flag, so "-solid" is not read as a flag plus
-	// the word "olid".
 	if r := after[0]; r != ' ' && r != '\n' && r != '\t' {
 		return trimmed, false
 	}

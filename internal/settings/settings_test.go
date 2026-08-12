@@ -3,6 +3,7 @@ package settings
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -25,7 +26,7 @@ func TestLoadSeedsFromDefaultsOnFirstRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if got := s.Get(); got != defaults() {
+	if got := s.Get(); !reflect.DeepEqual(got, defaults()) {
 		t.Errorf("Get() = %+v, want the environment's values", got)
 	}
 }

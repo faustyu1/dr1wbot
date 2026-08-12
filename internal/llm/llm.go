@@ -78,6 +78,15 @@ type Client struct {
 	answers  map[string]int // per model
 	quotaOut int            // requests that ran out of keys and models
 	failures int
+
+	// modelsMu guards the models slice so it can be swapped at runtime from
+	// the admin menu without stopping the bot.
+	modelsMu sync.RWMutex
+
+	// promptMu guards the system prompt so it can be swapped at runtime when
+	// the operator switches between presets in the admin panel.
+	promptMu      sync.RWMutex
+	promptBacking string
 }
 
 // Options configures a Client.
@@ -99,6 +108,23 @@ type Options struct {
 	HTTPClient      *http.Client // optional; tests inject their own
 }
 
+// SystemPrompt returns the client's configured system prompt. The tool loop
+// needs it because Chat sends raw messages and does not inject one itself,
+// while Complete does so internally.
+func (c *Client) SystemPrompt() string {
+	c.promptMu.RLock()
+	defer c.promptMu.RUnlock()
+	return c.promptBacking
+}
+
+// SetSystemPrompt replaces the system prompt at runtime, used when the operator
+// switches between presets in the admin panel. Thread-safe.
+func (c *Client) SetSystemPrompt(prompt string) {
+	c.promptMu.Lock()
+	c.promptBacking = prompt
+	c.promptMu.Unlock()
+}
+
 // New builds a Client. Timeout bounds a whole request including connection setup.
 func New(opts Options) *Client {
 	httpClient := opts.HTTPClient
@@ -109,7 +135,7 @@ func New(opts Options) *Client {
 	if cooldown <= 0 {
 		cooldown = time.Minute
 	}
-	return &Client{
+	c := &Client{
 		http:            httpClient,
 		baseURL:         strings.TrimRight(opts.BaseURL, "/"),
 		keys:            keyring.New(opts.APIKeys, cooldown),
@@ -119,6 +145,8 @@ func New(opts Options) *Client {
 		reasoningEffort: opts.ReasoningEffort,
 		answers:         make(map[string]int),
 	}
+	c.promptBacking = opts.SystemPrompt
+	return c
 }
 
 // ModelStat is one model's share of the answers.
@@ -174,11 +202,41 @@ func (c *Client) recordFailure(quotaOut bool) {
 	}
 }
 
+// toolCall is a function call the model requested.
+type toolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function toolCallFunc `json:"function"`
+}
+
+// toolCallFunc carries the name and raw-JSON arguments of one call.
+type toolCallFunc struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// toolDef is a function definition the model may call.
+type toolDef struct {
+	Type     string         `json:"type"`
+	Function toolDefinition `json:"function"`
+}
+
+// toolDefinition describes one callable function to the model.
+type toolDefinition struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
 // message carries either a plain string or, when pictures are attached, the
-// multipart content array that vision models expect.
+// multipart content array that vision models expect. For the tool-calling loop
+// it also carries tool_calls (assistant) and tool_call_id (tool result).
 type message struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"`
+	Role       string     `json:"role"`
+	Content    any        `json:"content"`
+	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Name       string     `json:"name,omitempty"`
 }
 
 type contentPart struct {
@@ -221,13 +279,15 @@ type completionRequest struct {
 	MaxTokens       int       `json:"max_completion_tokens,omitempty"`
 	ReasoningEffort string    `json:"reasoning_effort,omitempty"`
 	Stream          bool      `json:"stream"`
+	Tools           []toolDef `json:"tools,omitempty"`
 }
 
 type completionResponse struct {
 	Choices []struct {
 		Message struct {
-			Content string `json:"content"`
-			Refusal string `json:"refusal"`
+			Content   string     `json:"content"`
+			Refusal   string     `json:"refusal"`
+			ToolCalls []toolCall `json:"tool_calls"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -244,14 +304,15 @@ const errBodyLimit = 512
 // models in order and, for each, the key pool, so a spent quota costs a retry
 // rather than the answer.
 func (c *Client) Complete(ctx context.Context, req Request) (string, error) {
-	if len(c.models) == 0 {
+	models := c.ActiveModels()
+	if len(models) == 0 {
 		return "", fmt.Errorf("no model configured")
 	}
 	if c.keys.Len() == 0 {
 		return "", fmt.Errorf("no api key configured")
 	}
 
-	system := c.systemPrompt
+	system := c.SystemPrompt()
 	if req.System != "" {
 		system = req.System
 	}
@@ -275,7 +336,7 @@ func (c *Client) Complete(ctx context.Context, req Request) (string, error) {
 
 	var lastErr error
 	quotaHit := false
-	for _, model := range c.models {
+	for _, model := range models {
 		payload, err := json.Marshal(completionRequest{
 			Model:           model,
 			Messages:        messages,
@@ -383,38 +444,57 @@ func (c *Client) listModels(ctx context.Context, apiKey string) (int, error) {
 // menu screen, not a log line.
 const probeBodyLimit = 160
 
-// call is one attempt: one model, one key.
-func (c *Client) call(ctx context.Context, model, apiKey string, payload []byte) (string, error) {
+// callRaw sends one request and returns the parsed response. It is shared by
+// call (which extracts text) and Chat (which also needs tool calls).
+func (c *Client) callRaw(ctx context.Context, model, apiKey string, payload []byte) (completionResponse, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
-		return "", fmt.Errorf("build request: %w", err)
+		return completionResponse{}, fmt.Errorf("build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		return "", fmt.Errorf("call %s: %w", c.baseURL, err)
+		return completionResponse{}, fmt.Errorf("call %s: %w", c.baseURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", statusError(model, resp)
+		return completionResponse{}, statusError(model, resp)
 	}
 
 	var parsed completionResponse
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
+		return completionResponse{}, fmt.Errorf("decode response: %w", err)
 	}
 	if parsed.Error != nil {
-		return "", fmt.Errorf("llm error: %s", parsed.Error.Message)
+		return completionResponse{}, fmt.Errorf("llm error: %s", parsed.Error.Message)
 	}
 	if len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("llm returned no choices")
+		return completionResponse{}, fmt.Errorf("llm returned no choices")
+	}
+	return parsed, nil
+}
+
+// errToolCallsNotText means the model asked to call a function, but Complete —
+// which never sends tools — was used instead of Chat. The caller should switch
+// to Chat or disable tools on the model side.
+var errToolCallsNotText = errors.New("model returned tool calls; use Chat to handle them")
+
+// call is one attempt: one model, one key. It extracts the text answer; Chat
+// uses callRaw when it also needs tool calls.
+func (c *Client) call(ctx context.Context, model, apiKey string, payload []byte) (string, error) {
+	parsed, err := c.callRaw(ctx, model, apiKey, payload)
+	if err != nil {
+		return "", err
 	}
 
 	answer := strings.TrimSpace(parsed.Choices[0].Message.Content)
 	if answer == "" {
+		if len(parsed.Choices[0].Message.ToolCalls) > 0 {
+			return "", errToolCallsNotText
+		}
 		if refusal := strings.TrimSpace(parsed.Choices[0].Message.Refusal); refusal != "" {
 			return "", fmt.Errorf("model refused: %s", refusal)
 		}
@@ -442,5 +522,84 @@ func statusError(model string, resp *http.Response) error {
 	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return errors.Join(errOverloaded, err)
 	}
+	return err
+}
+
+// ActiveModels returns a snapshot of the configured model list. Thread-safe.
+func (c *Client) ActiveModels() []string {
+	c.modelsMu.RLock()
+	defer c.modelsMu.RUnlock()
+	out := make([]string, len(c.models))
+	copy(out, c.models)
+	return out
+}
+
+// SetModels replaces the active model list at runtime. Thread-safe.
+func (c *Client) SetModels(models []string) {
+	c.modelsMu.Lock()
+	c.models = models
+	c.modelsMu.Unlock()
+}
+
+// ListModels fetches the available model IDs from the /models endpoint.
+// Uses the first available key.
+func (c *Client) ListModels(ctx context.Context) ([]string, error) {
+	leases := c.keys.Lease()
+	if len(leases) == 0 {
+		return nil, fmt.Errorf("no api key configured")
+	}
+	apiKey := leases[0].Key
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/models", nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("call: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+
+	out := make([]string, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		out = append(out, m.ID)
+	}
+	return out, nil
+}
+
+// TestModel sends a minimal "hi" request to one model and returns nil on success.
+func (c *Client) TestModel(ctx context.Context, modelID string) error {
+	leases := c.keys.Lease()
+	if len(leases) == 0 {
+		return fmt.Errorf("no api key configured")
+	}
+	apiKey := leases[0].Key
+
+	payload, err := json.Marshal(completionRequest{
+		Model:     modelID,
+		Messages:  []message{{Role: "user", Content: "hi"}},
+		MaxTokens: 10,
+		Stream:    false,
+	})
+	if err != nil {
+		return fmt.Errorf("encode request: %w", err)
+	}
+
+	_, err = c.callRaw(ctx, modelID, apiKey, payload)
 	return err
 }

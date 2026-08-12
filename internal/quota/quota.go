@@ -267,6 +267,18 @@ func (s *Store) Take(userID int64) (used, limit int, ok bool) {
 	return used, limit, verdict == Granted
 }
 
+// Note records that a user interacted with the bot without consuming quota.
+// This lets the admin panel show whitelisted and admin users in "who wrote
+// today", not just public callers who go through Take/Judge.
+func (s *Store) Note(userID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rolloverLocked()
+	u := s.userLocked(userID)
+	u.Seen = s.now()
+	s.saveLocked()
+}
+
 // Judge is Take with the reason attached.
 func (s *Store) Judge(userID int64) (verdict Verdict, used, limit int) {
 	s.mu.Lock()

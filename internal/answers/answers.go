@@ -89,6 +89,17 @@ func (c *Cache) SetTTL(ttl time.Duration) {
 	}
 }
 
+// Clear empties the cache immediately without changing the TTL, so the next
+// identical question goes to the model instead of returning a stored answer.
+func (c *Cache) Clear() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[string]entry)
+}
+
 // Key derives the cache key. The system prompt is part of it because the same
 // question asked with the house style and without it are different questions.
 func Key(system, prompt string) string {

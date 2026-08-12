@@ -23,12 +23,14 @@ import (
 
 	"dr1wbot/internal/alert"
 	"dr1wbot/internal/answers"
+	"dr1wbot/internal/config"
 	"dr1wbot/internal/imagegen"
 	"dr1wbot/internal/intent"
 	"dr1wbot/internal/llm"
 	"dr1wbot/internal/mdtext"
 	"dr1wbot/internal/memory"
 	"dr1wbot/internal/quota"
+	"dr1wbot/internal/session"
 	"dr1wbot/internal/tgemoji"
 )
 
@@ -55,6 +57,11 @@ type Downloader interface {
 	Download(ctx context.Context, fileID string) ([]byte, error)
 }
 
+// Transcriber converts audio to text. Empty/nil disables voice support.
+type Transcriber interface {
+	Transcribe(ctx context.Context, audio []byte, format string) (string, error)
+}
+
 // Remembrancer keeps the short conversation history guest mode does not give us.
 type Remembrancer interface {
 	History(chatID int64) []memory.Turn
@@ -67,6 +74,7 @@ type Remembrancer interface {
 type Rationer interface {
 	Enabled() bool
 	Judge(userID int64) (verdict quota.Verdict, used, limit int)
+	Note(userID int64)
 }
 
 // Cache serves repeated questions without going to the model.
@@ -74,6 +82,15 @@ type Cache interface {
 	Enabled() bool
 	Get(key string) (string, bool)
 	Put(key, answer string)
+	Clear()
+}
+
+// SessionArchiver saves and restores full conversations so a user can start
+// fresh and come back to an old thread via a deep link.
+type SessionArchiver interface {
+	Archive(userID int64) (string, error)
+	Restore(userID int64, hash string) error
+	Archives(userID int64) []session.ArchiveEntry
 }
 
 // Notifier tells the admins about things they would otherwise only find by
@@ -134,6 +151,7 @@ type Handler struct {
 	model       llm.Completer
 	images      imagegen.Generator // nil disables picture generation
 	files       Downloader         // nil disables reading attachments
+	voice       Transcriber        // nil disables voice messages
 	recall      Remembrancer       // nil disables conversation history
 	allow       Gatekeeper
 	ration      Rationer // nil keeps the bot whitelist-only
@@ -158,26 +176,36 @@ type Handler struct {
 	waiting  int
 	maxQueue int
 
-	rawFlagOff      bool
-	botID           int64
-	botUsername     string
-	storageChatID   int64
-	maxReplyRunes   int
-	timeout         time.Duration
-	imageTimeout    time.Duration
-	commandReplyTTL time.Duration
-	rawSystemPrompt string
-	publicMaxTokens int
-	publicMaxRunes  int
+	rawFlagOff        bool
+	dmRecall          Remembrancer    // nil = use recall for DMs too
+	sessionArchiver   SessionArchiver // nil = no /reset or restore link
+	botID             int64
+	botUsername       string
+	storageChatID     int64
+	maxReplyRunes     int
+	timeout           time.Duration
+	imageTimeout      time.Duration
+	commandReplyTTL   time.Duration
+	rawSystemPrompt   string
+	divkaSystemPrompt string
+	presets           PresetResolver // nil = global default for everyone
+	publicMaxTokens   int
+	publicMaxRunes    int
 }
 
 // Options configures a Handler.
 type Options struct {
-	Sender   Sender
-	Model    llm.Completer
-	Images   imagegen.Generator
-	Files    Downloader
-	Memory   Remembrancer
+	Sender Sender
+	Model  llm.Completer
+	Images imagegen.Generator
+	Files  Downloader
+	Voice  Transcriber // nil = no voice transcription
+	Memory Remembrancer
+	// DMRecall, when set, replaces Memory for admin private chats so their
+	// conversations are persistent and compressed. Nil keeps the ephemeral store.
+	DMRecall Remembrancer
+	// Sessions enables /reset and restore links. Nil disables both.
+	Sessions SessionArchiver
 	Access   Gatekeeper
 	Quota    Rationer
 	Cache    Cache
@@ -200,6 +228,14 @@ type Options struct {
 	// RawSystemPrompt replaces the house style when an admin prefixes a
 	// question with mdtext.RawFlag. Empty disables the flag entirely.
 	RawSystemPrompt string
+
+	// DivkaSystemPrompt switches to the Дианочка persona when any user prefixes
+	// a question with mdtext.DivkaFlag. Empty disables the flag entirely.
+	DivkaSystemPrompt string
+
+	// Presets resolves per-user system-prompt presets. Nil means everyone uses
+	// the model's global system prompt.
+	Presets PresetResolver
 	// PublicMaxTokens caps what a non-whitelisted question may spend on the
 	// answer. Zero leaves them on the same budget as everybody else.
 	PublicMaxTokens int
@@ -220,33 +256,38 @@ func New(opts Options) *Handler {
 		opts.ImageTimeout = 2 * time.Minute
 	}
 	return &Handler{
-		after:         func(d time.Duration, f func()) { time.AfterFunc(d, f) },
-		sender:        opts.Sender,
-		model:         opts.Model,
-		images:        opts.Images,
-		files:         opts.Files,
-		recall:        opts.Memory,
-		allow:         opts.Access,
-		ration:        opts.Quota,
-		cache:         opts.Cache,
-		alerts:        opts.Alerts,
-		commands:      opts.Commands,
-		log:           opts.Logger,
-		sem:           make(chan struct{}, opts.MaxConcurrent),
-		placeholder:   placeholderMessage(),
-		botID:         opts.BotID,
-		botUsername:   opts.BotUsername,
-		storageChatID: opts.StorageChatID,
-		maxReplyRunes: opts.MaxReplyRunes,
-		timeout:       opts.Timeout,
-		imageTimeout:  opts.ImageTimeout,
+		after:           func(d time.Duration, f func()) { time.AfterFunc(d, f) },
+		sender:          opts.Sender,
+		model:           opts.Model,
+		images:          opts.Images,
+		files:           opts.Files,
+		voice:           opts.Voice,
+		recall:          opts.Memory,
+		dmRecall:        opts.DMRecall,
+		sessionArchiver: opts.Sessions,
+		allow:           opts.Access,
+		ration:          opts.Quota,
+		cache:           opts.Cache,
+		alerts:          opts.Alerts,
+		commands:        opts.Commands,
+		log:             opts.Logger,
+		sem:             make(chan struct{}, opts.MaxConcurrent),
+		placeholder:     placeholderMessage(),
+		botID:           opts.BotID,
+		botUsername:     opts.BotUsername,
+		storageChatID:   opts.StorageChatID,
+		maxReplyRunes:   opts.MaxReplyRunes,
+		timeout:         opts.Timeout,
+		imageTimeout:    opts.ImageTimeout,
 
-		commandReplyTTL: opts.CommandReplyTTL,
-		rawSystemPrompt: opts.RawSystemPrompt,
-		publicMaxTokens: opts.PublicMaxTokens,
-		publicMaxRunes:  opts.PublicMaxRunes,
-		maxQueue:        opts.MaxQueue,
-		inflight:        make(map[int64]struct{}),
+		commandReplyTTL:   opts.CommandReplyTTL,
+		rawSystemPrompt:   opts.RawSystemPrompt,
+		divkaSystemPrompt: opts.DivkaSystemPrompt,
+		presets:           opts.Presets,
+		publicMaxTokens:   opts.PublicMaxTokens,
+		publicMaxRunes:    opts.PublicMaxRunes,
+		maxQueue:          opts.MaxQueue,
+		inflight:          make(map[int64]struct{}),
 	}
 }
 
@@ -293,6 +334,9 @@ func (h *Handler) HandleGuestMessage(ctx context.Context, msg telego.Message) er
 	if msg.From != nil {
 		userID = msg.From.ID
 	}
+	if h.ration != nil {
+		h.ration.Note(userID)
+	}
 	log := h.log.With("chat_id", msg.Chat.ID, "user_id", userID)
 
 	privileged := h.allow.Allowed(userID, msg.Chat.ID)
@@ -300,6 +344,48 @@ func (h *Handler) HandleGuestMessage(ctx context.Context, msg telego.Message) er
 		// Stay silent rather than announcing the whitelist to strangers.
 		log.Debug("summon rejected: not whitelisted")
 		return nil
+	}
+
+	// Debug: log what reply_to_message contains so we can diagnose context issues.
+	if msg.ReplyToMessage != nil {
+		rtm := msg.ReplyToMessage
+		fromID := int64(0)
+		if rtm.From != nil {
+			fromID = rtm.From.ID
+		}
+		log.Debug("guest message has reply_to_message",
+			"rtm_text_len", len(rtm.Text),
+			"rtm_caption_len", len(rtm.Caption),
+			"rtm_from_id", fromID,
+			"rtm_guest_query_id", rtm.GuestQueryID,
+			"rtm_guest_bot_caller_user", rtm.GuestBotCallerUser != nil,
+			"rtm_external_reply", rtm.ExternalReply != nil,
+		)
+	} else {
+		log.Debug("guest message has no reply_to_message",
+			"external_reply", msg.ExternalReply != nil)
+	}
+
+	// Voice message: transcribe to text before processing.
+	log.Debug("voice check",
+		"has_voice", msg.Voice != nil,
+		"has_transcriber", h.voice != nil,
+		"text_len", len(msg.Text),
+		"text", msg.Text,
+	)
+	if msg.Voice != nil && h.voice != nil && strings.TrimSpace(msg.Text) == "" {
+		transcribed, err := h.transcribeVoice(ctx, msg.Voice)
+		if err != nil {
+			log.Warn("voice transcription failed", "err", err)
+			inlineID, aErr := h.answer(ctx, msg.GuestQueryID, markdown("Не удалось распознать голосовое сообщение."))
+			if aErr != nil {
+				return aErr
+			}
+			h.expireCommandReply(ctx, log, inlineID)
+			return nil
+		}
+		log.Info("voice transcribed", "text_len", len(transcribed), "text", transcribed)
+		msg.Text = transcribed
 	}
 
 	question := strippedText(msg, h.botUsername)
@@ -319,6 +405,7 @@ func (h *Handler) HandleGuestMessage(ctx context.Context, msg telego.Message) er
 	}
 
 	question, raw := h.rawRequested(question, userID)
+	question, divka := h.divkaRequested(question)
 
 	if prompt, kind := intent.Detect(question); kind == intent.Image {
 		if !privileged {
@@ -328,7 +415,51 @@ func (h *Handler) HandleGuestMessage(ctx context.Context, msg telego.Message) er
 		return h.drawPicture(ctx, log, msg.GuestQueryID, prompt)
 	}
 
-	return h.answerQuestion(ctx, log, msg, question, raw, privileged)
+	return h.answerQuestion(ctx, log, msg, question, raw, divka, privileged)
+}
+
+// guestHistory returns conversation history for guest mode. When a persistent DM
+// store is configured, every user gets per-user context keyed on userID — not
+// just admins. Without it, the ephemeral in-memory store is used with chatID.
+func (h *Handler) guestHistory(chatID, userID int64, followUp bool) []llm.Turn {
+	if h.dmRecall != nil {
+		// Persistent per-user context: always continue, regardless of followUp.
+		remembered := h.dmRecall.History(userID)
+		turns := make([]llm.Turn, 0, len(remembered))
+		for _, t := range remembered {
+			turns = append(turns, llm.Turn{Role: t.Role, Content: t.Content})
+		}
+		return turns
+	}
+	return h.history(chatID, followUp)
+}
+
+// PresetResolver returns the active system-prompt preset name for a given user,
+// or "" when no custom preset is set. This lets each user have their own
+// system prompt independent of the global default.
+type PresetResolver interface {
+	UserPreset(userID int64) string
+}
+
+// resolveSystem picks the system prompt for a request. Flag overrides (raw,
+// divka) win first. When no flag is set, a per-user preset is checked; if the
+// user has one, it replaces the model's global system prompt. Empty string
+// means "use whatever the model is configured with".
+func (h *Handler) resolveSystem(raw, divka bool, userID int64) string {
+	switch {
+	case raw:
+		return h.rawSystemPrompt
+	case divka:
+		return h.divkaSystemPrompt
+	}
+	if h.presets != nil {
+		if name := h.presets.UserPreset(userID); name != "" {
+			if p := config.PresetByName(name); p.Name == name {
+				return p.Text
+			}
+		}
+	}
+	return ""
 }
 
 // alert forwards news to the admins when a notifier is configured.
@@ -362,16 +493,50 @@ func (h *Handler) rawRequested(question string, userID int64) (string, bool) {
 	return rest, true
 }
 
+// divkaRequested pulls the Divka flag off a question. Unlike the raw flag,
+// this one is available to everyone — it is a fun persona mode, not a
+// privileged override. Empty divkaSystemPrompt disables it entirely.
+func (h *Handler) divkaRequested(question string) (string, bool) {
+	if h.divkaSystemPrompt == "" {
+		return question, false
+	}
+	rest, divka := mdtext.StripDivkaFlag(question)
+	if !divka {
+		return question, false
+	}
+	return rest, true
+}
+
 // HandleDirectMessage answers an ordinary private-chat message. The private
 // chat is not guest mode: there is no query to answer once and no inline
 // message to edit, so the reply is simply sent. Everything else — the
 // whitelist, the allowance, the caps, the cache — is the same, because a
 // private chat is not a way around any of it.
 func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) error {
-	if msg.From == nil || strings.TrimSpace(msg.Text) == "" {
+	if msg.From == nil {
+		return nil
+	}
+
+	// Voice message: transcribe to text and proceed as a normal question.
+	if msg.Voice != nil && h.voice != nil && strings.TrimSpace(msg.Text) == "" {
+		transcribed, err := h.transcribeVoice(ctx, msg.Voice)
+		if err != nil {
+			h.log.Warn("voice transcription failed", "err", err)
+			return h.sendPlain(ctx, msg.Chat.ID, "Не удалось распознать голосовое сообщение.")
+		}
+		if strings.TrimSpace(transcribed) == "" {
+			return h.sendPlain(ctx, msg.Chat.ID, "Голосовое сообщение пустое.")
+		}
+		msg.Text = transcribed
+	}
+
+	if strings.TrimSpace(msg.Text) == "" {
 		return nil
 	}
 	userID := msg.From.ID
+	if h.ration != nil {
+		h.ration.Note(userID)
+	}
 	log := h.log.With("chat_id", msg.Chat.ID, "user_id", userID, "direct", true)
 
 	privileged := h.allow.Allowed(userID, msg.Chat.ID)
@@ -381,6 +546,27 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 	}
 
 	question := strings.TrimSpace(msg.Text)
+
+	// Built-in commands handled before the admin command table so they work
+	// even when the external command set is empty. In group chats Telegram
+	// appends @botUsername to commands; strip it so both forms work.
+	cmd := question
+	if at := strings.IndexByte(cmd, '@'); at > 0 {
+		cmd = cmd[:at]
+	}
+	switch cmd {
+	case "/reset":
+		if h.sessionArchiver != nil {
+			return h.handleReset(ctx, msg.Chat.ID, userID)
+		}
+	case "/clearcache":
+		return h.handleClearCache(ctx, msg.Chat.ID)
+	case "/sessions":
+		if h.sessionArchiver != nil {
+			return h.handleSessionsList(ctx, msg.Chat.ID, userID)
+		}
+	}
+
 	if h.commands != nil {
 		if answer, ok := h.commands.Handle(question, userID); ok {
 			return h.sendPlain(ctx, msg.Chat.ID, answer)
@@ -388,6 +574,7 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 	}
 
 	question, raw := h.rawRequested(question, userID)
+	question, divka := h.divkaRequested(question)
 	maxTokens, maxRunes := h.publicCaps()
 
 	// Claim the in-flight slot before charging quota, so a rejected double-tap
@@ -399,6 +586,7 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 	defer done()
 
 	var budget int
+	isAdmin := h.allow.IsAdmin(userID)
 	if !privileged {
 		if maxRunes > 0 && len([]rune(question)) > maxRunes {
 			return h.sendPlain(ctx, msg.Chat.ID, msgTooLong)
@@ -412,6 +600,19 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 		case quota.Spent:
 			return h.sendPlain(ctx, msg.Chat.ID, msgQuotaSpent(limit))
 		}
+	}
+	// Admins get the full model maximum (budget stays zero). Whitelisted
+	// users are capped tighter than the public knob so they don't burn the
+	// API: 512 tokens is enough for a useful answer without subsidising a
+	// private chat habit. The public knob governs strangers. Divka (-d) gets
+	// full headroom because tool-augmented answers (reading channels, search)
+	// need room to breathe after the tool results come back.
+	switch {
+	case raw || isAdmin || divka:
+		// budget stays zero → use the model's configured maximum.
+	case privileged:
+		budget = 512
+	default:
 		budget = maxTokens
 	}
 
@@ -431,17 +632,14 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 	llmCtx, cancel := context.WithTimeout(ctx, h.timeout)
 	defer cancel()
 
-	system := ""
-	if raw {
-		system = h.rawSystemPrompt
-	}
+	system := h.resolveSystem(raw, divka, userID)
 
 	// A private chat is a real conversation, so every message continues it —
 	// there is no reply-to signal to wait for the way guest mode needs one.
 	started := time.Now()
 	answer, err := h.model.Complete(llmCtx, llm.Request{
 		Prompt:    question,
-		History:   h.history(msg.Chat.ID, true),
+		History:   h.dmHistory(msg.Chat.ID, userID),
 		System:    system,
 		MaxTokens: budget,
 	})
@@ -459,13 +657,14 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 		}
 		return h.editChatText(ctx, msg.Chat.ID, messageID, text)
 	}
-	log.Info("answered", "took", time.Since(started), "runes", len([]rune(answer)), "raw", raw)
+	log.Info("answered", "took", time.Since(started), "runes", len([]rune(answer)), "raw", raw, "divka", divka)
 
-	if h.recall != nil {
-		h.recall.Remember(msg.Chat.ID, question, answer)
+	store := h.dmRemembrancer(userID)
+	if store != nil {
+		store.Remember(userID, question, answer)
 	}
 
-	return h.editChatText(ctx, msg.Chat.ID, messageID, mdtext.Truncate(answer, h.maxReplyRunes))
+	return h.editChatText(ctx, msg.Chat.ID, messageID, tgemoji.UpgradeEmoji(mdtext.Truncate(answer, h.maxReplyRunes)))
 }
 
 // sendPlaceholder posts the "working on it" marker and returns its id, so the
@@ -494,28 +693,31 @@ func (h *Handler) sendPlaceholder(ctx context.Context, chatID int64) (int, error
 
 // editChatText replaces a private-chat message with text.
 //
-// It goes through a rich message, the same as the guest path: that dialect
-// carries headings, tables and fenced code, which is what the model actually
-// emits and what the legacy Markdown parse mode cannot render. A rejected edit
-// is retried as unformatted text, so the content always arrives.
+// Markdown is converted to Telegram-compatible HTML, the same as the guest
+// path: this carries bold, italic, code blocks, custom emoji and links. A
+// rejected edit is retried as unformatted text, so the content always arrives.
 func (h *Handler) editChatText(parent context.Context, chatID int64, messageID int, text string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), editTimeout)
 	defer cancel()
 
+	html := mdtext.ConvertMarkdown(text)
+
 	_, err := h.sender.EditMessageText(ctx, &telego.EditMessageTextParams{
-		ChatID:      telego.ChatID{ID: chatID},
-		MessageID:   messageID,
-		RichMessage: &telego.InputRichMessage{Markdown: text},
+		ChatID:             telego.ChatID{ID: chatID},
+		MessageID:          messageID,
+		Text:               html,
+		ParseMode:          telego.ModeHTML,
+		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
 	})
 	if err == nil {
 		return nil
 	}
 
-	h.log.Warn("rich edit rejected in a private chat, retrying as plain text", "err", err)
+	h.log.Warn("html edit rejected in a private chat, retrying as plain text", "err", err)
 	_, plainErr := h.sender.EditMessageText(ctx, &telego.EditMessageTextParams{
 		ChatID:             telego.ChatID{ID: chatID},
 		MessageID:          messageID,
-		Text:               text,
+		Text:               tgemoji.Strip(html),
 		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
 	})
 	if plainErr != nil {
@@ -559,7 +761,7 @@ func (h *Handler) expireCommandReply(ctx context.Context, log *slog.Logger, inli
 }
 
 // answerQuestion is the text path: placeholder, model, edit.
-func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg telego.Message, question string, raw, privileged bool) error {
+func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg telego.Message, question string, raw, divka, privileged bool) error {
 	// Replying to one of our answers is the only signal that this is the same
 	// conversation. A fresh summon is a fresh topic even in the same chat, so it
 	// starts from nothing rather than inheriting whatever was discussed before.
@@ -577,8 +779,7 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 	}
 	maxTokens, maxRunes := h.publicCaps()
 
-	// budget is left at zero for privileged callers, which means "use the
-	// configured maximum".
+	// budget: zero means "use the model's configured maximum" (admins / raw mode).
 	var budget int
 
 	// A picture is the most expensive thing that can be attached to a question:
@@ -643,9 +844,18 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 		default:
 			log = log.With("public", true, "used", used, "limit", limit)
 		}
-
-		// Public answers are capped tighter than an admin's: output tokens are
-		// the expensive half, and a stranger's question rarely needs an essay.
+	}
+	// Admins get the full model maximum (budget stays zero). Whitelisted
+	// users are capped at 512 tokens — enough for a solid answer, not enough
+	// to subsidise a private-clone habit. Strangers get the public knob. Divka
+	// gets full headroom for tool-augmented answers.
+	isAdmin := h.allow.IsAdmin(userID)
+	switch {
+	case raw || isAdmin || divka:
+		// budget stays zero → use the model's configured maximum.
+	case privileged:
+		budget = 512
+	default:
 		budget = maxTokens
 	}
 	inlineID, err := h.answer(ctx, msg.GuestQueryID, h.placeholder)
@@ -663,10 +873,7 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 	llmCtx, cancel := context.WithTimeout(ctx, h.timeout)
 	defer cancel()
 
-	system := ""
-	if raw {
-		system = h.rawSystemPrompt
-	}
+	system := h.resolveSystem(raw, divka, userID)
 
 	// Only a question that stands entirely on its own can be cached: a
 	// follow-up depends on a conversation, and a picture makes two identical
@@ -677,11 +884,13 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 		cacheKey = answers.Key(system, prompt)
 		if cached, hit := h.cache.Get(cacheKey); hit {
 			log.Info("answered from cache", "runes", len([]rune(cached)))
-			if h.recall != nil {
+			if h.dmRecall != nil {
+				h.dmRecall.Remember(userID, attribute(msg, prompt), cached)
+			} else if h.recall != nil {
 				h.recall.Forget(msg.Chat.ID)
 				h.recall.Remember(msg.Chat.ID, attribute(msg, prompt), cached)
 			}
-			return h.editText(ctx, inlineID, mdtext.Truncate(cached, h.maxReplyRunes))
+			return h.editText(ctx, inlineID, tgemoji.UpgradeEmoji(mdtext.Truncate(cached, h.maxReplyRunes)))
 		}
 	}
 
@@ -689,7 +898,7 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 	answer, err := h.model.Complete(llmCtx, llm.Request{
 		Prompt:    prompt,
 		Images:    attachments,
-		History:   h.history(msg.Chat.ID, followUp),
+		History:   h.guestHistory(msg.Chat.ID, userID, followUp),
 		System:    system,
 		MaxTokens: budget,
 	})
@@ -710,11 +919,13 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 		return h.editText(ctx, inlineID, text)
 	}
 	log.Info("answered", "took", time.Since(started), "runes", len([]rune(answer)),
-		"follow_up", followUp, "raw", raw, "pictures", len(attachments))
+		"follow_up", followUp, "raw", raw, "divka", divka, "pictures", len(attachments))
 	if cacheable {
 		h.cache.Put(cacheKey, answer)
 	}
-	if h.recall != nil {
+	if h.dmRecall != nil {
+		h.dmRecall.Remember(userID, attribute(msg, prompt), answer)
+	} else if h.recall != nil {
 		// Dropping the old thread here rather than before the call means a
 		// failed answer leaves the previous conversation intact.
 		if !followUp {
@@ -723,7 +934,7 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 		h.recall.Remember(msg.Chat.ID, attribute(msg, prompt), answer)
 	}
 
-	return h.editText(ctx, inlineID, mdtext.Truncate(answer, h.maxReplyRunes))
+	return h.editText(ctx, inlineID, tgemoji.UpgradeEmoji(mdtext.Truncate(answer, h.maxReplyRunes)))
 }
 
 // history returns what we remember of this conversation. A summon that is not a
@@ -735,6 +946,33 @@ func (h *Handler) history(chatID int64, followUp bool) []llm.Turn {
 		return nil
 	}
 	remembered := h.recall.History(chatID)
+	turns := make([]llm.Turn, 0, len(remembered))
+	for _, t := range remembered {
+		turns = append(turns, llm.Turn{Role: t.Role, Content: t.Content})
+	}
+	return turns
+}
+
+// dmRemembrancer picks the persistent session store for private chats. When a
+// DM store is configured, every user gets persistent per-user context — not
+// just admins. Without it, the ephemeral in-memory store is used.
+func (h *Handler) dmRemembrancer(userID int64) Remembrancer {
+	if h.dmRecall != nil {
+		return h.dmRecall
+	}
+	return h.recall
+}
+
+// dmHistory is history() for the private-chat path: it always continues the
+// conversation (followUp is always true in DMs) and uses the right store.
+func (h *Handler) dmHistory(chatID, userID int64) []llm.Turn {
+	store := h.dmRemembrancer(userID)
+	if store == nil {
+		return nil
+	}
+	// In private chats chatID == userID, but we key on userID so context is
+	// per-user even if Telegram reuses a chat ID.
+	remembered := store.History(userID)
 	turns := make([]llm.Turn, 0, len(remembered))
 	for _, t := range remembered {
 		turns = append(turns, llm.Turn{Role: t.Role, Content: t.Content})
@@ -998,26 +1236,30 @@ func (h *Handler) answer(ctx context.Context, guestQueryID string, content teleg
 // message even if the handler was cancelled meanwhile.
 const editTimeout = 30 * time.Second
 
-// editText replaces the placeholder with text. Rich Markdown is what makes the
-// answer look native in Telegram, but a model can emit markup the renderer
-// rejects, so a rejected edit is retried as unformatted text: the user always
-// gets the content, at worst without the styling.
+// editText replaces the placeholder with text. Markdown is converted to
+// Telegram-compatible HTML so custom emoji (<tg-emoji>) and rich formatting
+// work in inline messages. A rejected edit is retried as unformatted text:
+// the user always gets the content, at worst without the styling.
 func (h *Handler) editText(parent context.Context, inlineMessageID, text string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), editTimeout)
 	defer cancel()
 
+	html := mdtext.ConvertMarkdown(text)
+
 	_, err := h.sender.EditMessageText(ctx, &telego.EditMessageTextParams{
-		InlineMessageID: inlineMessageID,
-		RichMessage:     &telego.InputRichMessage{Markdown: text},
+		InlineMessageID:    inlineMessageID,
+		Text:               html,
+		ParseMode:          telego.ModeHTML,
+		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
 	})
 	if err == nil {
 		return nil
 	}
 
-	h.log.Warn("rich edit rejected, retrying as plain text", "err", err)
+	h.log.Warn("html edit rejected, retrying as plain text", "err", err)
 	_, plainErr := h.sender.EditMessageText(ctx, &telego.EditMessageTextParams{
 		InlineMessageID:    inlineMessageID,
-		Text:               text,
+		Text:               tgemoji.Strip(html),
 		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
 	})
 	if plainErr != nil {
@@ -1026,14 +1268,36 @@ func (h *Handler) editText(parent context.Context, inlineMessageID, text string)
 	return nil
 }
 
-// markdown wraps text as a rich message.
+// markdown wraps text as an HTML rich message (for answerGuestQuery).
 func markdown(text string) telego.InputRichMessage {
-	return telego.InputRichMessage{Markdown: text}
+	return telego.InputRichMessage{HTML: mdtext.ConvertMarkdown(text)}
 }
 
 // truncateCaption keeps a caption within Telegram's limit.
 func truncateCaption(s string) string {
 	return mdtext.Truncate(s, captionLimit-1)
+}
+
+// transcribeVoice downloads a voice file from Telegram and sends it to Groq
+// Whisper for transcription.
+func (h *Handler) transcribeVoice(ctx context.Context, voice *telego.Voice) (string, error) {
+	if h.files == nil {
+		return "", fmt.Errorf("file downloader not configured")
+	}
+	audio, err := h.files.Download(ctx, voice.FileID)
+	if err != nil {
+		return "", fmt.Errorf("download voice: %w", err)
+	}
+	format := "ogg"
+	if voice.MimeType != "" {
+		// Telegram voice messages are OGG Opus.
+		format = "ogg"
+	}
+	transcribed, err := h.voice.Transcribe(ctx, audio, format)
+	if err != nil {
+		return "", fmt.Errorf("transcribe: %w", err)
+	}
+	return transcribed, nil
 }
 
 // strippedText returns the summoning message without the mention that
@@ -1075,4 +1339,63 @@ func resultID() string {
 		return "dr1wbot"
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// handleReset archives the current conversation and tells the user how to get
+// back to it. If there is nothing to archive, it just clears things.
+func (h *Handler) handleReset(ctx context.Context, chatID, userID int64) error {
+	hash, err := h.sessionArchiver.Archive(userID)
+	if err != nil {
+		h.log.Warn("archive failed", "err", err, "user_id", userID)
+		return h.sendPlain(ctx, chatID, "⚠️ Не удалось сохранить сессию. Попробуйте ещё раз.")
+	}
+	if hash == "" {
+		return h.sendPlain(ctx, chatID,
+			"🧹 История очищена. Начинайте новый диалог — я ничего не помню из прошлого.")
+	}
+	link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, hash)
+	text := fmt.Sprintf(
+		"🧹 <b>Сессия сохранена и очищена.</b>\n\n"+
+			"Возвращайтесь к старому диалогу в любой момент:\n%s\n\n"+
+			"Или командой /sessions — покажу все сохранённые сессии.",
+		link)
+	return h.sendPlain(ctx, chatID, text)
+}
+
+// handleClearCache empties the answer cache so the next identical question is
+// sent to the model instead of returning a stored reply.
+func (h *Handler) handleClearCache(ctx context.Context, chatID int64) error {
+	if h.cache != nil {
+		h.cache.Clear()
+	}
+	return h.sendPlain(ctx, chatID,
+		"🗑 Кэш ответов сброшен. Теперь каждый вопрос идёт к модели заново.")
+}
+
+// handleSessionsList shows the user their archived conversations with restore
+// links. A friendly fallback message is shown when there are none.
+func (h *Handler) handleSessionsList(ctx context.Context, chatID, userID int64) error {
+	entries := h.sessionArchiver.Archives(userID)
+	if len(entries) == 0 {
+		return h.sendPlain(ctx, chatID,
+			"📂 У вас нет сохранённых сессий.\nИспользуйте /reset, чтобы сохранить текущую и начать новую.")
+	}
+
+	var b strings.Builder
+	b.WriteString("📂 <b>Сохранённые сессии:</b>\n\n")
+	for i, e := range entries {
+		link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, e.Hash)
+		b.WriteString(fmt.Sprintf("%d. %s\n   %d сообщений\n   %s\n\n",
+			i+1, e.Preview, e.Turns, link))
+	}
+	return h.sendPlain(ctx, chatID, b.String())
+}
+
+// RestoreSession loads an archived conversation back as the active one.
+// Called by the menu handler when a user clicks a restore deep link.
+func (h *Handler) RestoreSession(userID int64, hash string) error {
+	if h.sessionArchiver == nil {
+		return fmt.Errorf("sessions not configured")
+	}
+	return h.sessionArchiver.Restore(userID, hash)
 }

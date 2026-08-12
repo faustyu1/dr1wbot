@@ -72,8 +72,8 @@ type editCall struct {
 	inlineMessageID string
 	chatID          int64
 	messageID       int
-	markdown        string // set when the edit used a rich message
-	plain           string // set when the edit used plain text
+	html            string // set when the edit used parse_mode=HTML
+	plain           string // set when the edit used plain text (fallback)
 }
 
 func (f *fakeSender) AnswerGuestQuery(_ context.Context, p *telego.AnswerGuestQueryParams) (*telego.SentGuestMessage, error) {
@@ -89,7 +89,12 @@ func (f *fakeSender) AnswerGuestQuery(_ context.Context, p *telego.AnswerGuestQu
 		return nil, errors.New("content is not a rich message")
 	}
 	rm := content.RichMessage
-	f.answers = append(f.answers, rm.Markdown)
+	// Record whichever field was populated.
+	recorded := rm.Markdown
+	if recorded == "" {
+		recorded = rm.HTML
+	}
+	f.answers = append(f.answers, recorded)
 	f.answerHTML = append(f.answerHTML, rm.HTML)
 
 	if f.answerErr != nil {
@@ -103,8 +108,8 @@ func (f *fakeSender) EditMessageText(_ context.Context, p *telego.EditMessageTex
 	defer f.mu.Unlock()
 
 	call := editCall{inlineMessageID: p.InlineMessageID, chatID: p.ChatID.ID, messageID: p.MessageID}
-	if p.RichMessage != nil {
-		call.markdown = p.RichMessage.Markdown
+	if p.ParseMode == telego.ModeHTML {
+		call.html = p.Text
 		f.edits = append(f.edits, call)
 		if f.richEditErr != nil {
 			return nil, f.richEditErr
@@ -399,8 +404,11 @@ func TestAnswersWithPlaceholderThenEdit(t *testing.T) {
 	}
 
 	answers, edits := sender.snapshot()
-	if len(answers) != 1 || answers[0] != "" {
-		t.Fatalf("answers = %q, want the placeholder to be sent as HTML, not markdown", answers)
+	if len(answers) != 1 {
+		t.Fatalf("answers = %q, want exactly one", answers)
+	}
+	if !strings.Contains(answers[0], "tg-emoji") {
+		t.Fatalf("answers = %q, want the placeholder to be sent as HTML with custom emoji", answers)
 	}
 	if len(edits) != 1 {
 		t.Fatalf("edits = %+v, want exactly one", edits)
@@ -408,11 +416,11 @@ func TestAnswersWithPlaceholderThenEdit(t *testing.T) {
 	if edits[0].inlineMessageID != testInlineID {
 		t.Errorf("edit targeted %q, want the id returned by answerGuestQuery (%q)", edits[0].inlineMessageID, testInlineID)
 	}
-	if edits[0].markdown != model.answer {
-		t.Errorf("edit markdown = %q, want the model answer %q", edits[0].markdown, model.answer)
+	if !strings.Contains(edits[0].html, "Ответ") || !strings.Contains(edits[0].html, "таблица") {
+		t.Errorf("edit html = %q, want to contain the answer text", edits[0].html)
 	}
 	if edits[0].plain != "" {
-		t.Error("edit used plain text, want rich markdown on the happy path")
+		t.Error("edit used plain text, want HTML on the happy path")
 	}
 }
 
@@ -696,7 +704,7 @@ func TestModelErrorIsShownToTheUser(t *testing.T) {
 	}
 
 	_, edits := sender.snapshot()
-	if len(edits) != 1 || edits[0].markdown != msgFailed {
+	if len(edits) != 1 || edits[0].html != msgFailed {
 		t.Errorf("edits = %+v, want a single edit with %q", edits, msgFailed)
 	}
 }
@@ -714,7 +722,7 @@ func TestModelTimeoutIsShownToTheUser(t *testing.T) {
 	}
 
 	_, edits := sender.snapshot()
-	if len(edits) != 1 || edits[0].markdown != msgTimeout {
+	if len(edits) != 1 || edits[0].html != msgTimeout {
 		t.Errorf("edits = %+v, want a single edit with %q", edits, msgTimeout)
 	}
 }
@@ -733,8 +741,8 @@ func TestRejectedRichEditFallsBackToPlainText(t *testing.T) {
 	if len(edits) != 2 {
 		t.Fatalf("edits = %+v, want a rich attempt followed by a plain retry", edits)
 	}
-	if edits[0].markdown != answer {
-		t.Errorf("first edit = %q, want the rich attempt with %q", edits[0].markdown, answer)
+	if edits[0].html != answer {
+		t.Errorf("first edit = %q, want the rich attempt with %q", edits[0].html, answer)
 	}
 	if edits[1].plain != answer {
 		t.Errorf("retry = %+v, want plain text %q so the content still reaches the user", edits[1], answer)
@@ -782,7 +790,7 @@ func TestAnswerIsTruncated(t *testing.T) {
 	}
 
 	_, edits := sender.snapshot()
-	if got := len([]rune(edits[0].markdown)); got > 102 {
+	if got := len([]rune(edits[0].html)); got > 102 {
 		t.Errorf("edit is %d runes, want it truncated to about 100", got)
 	}
 }
@@ -830,7 +838,7 @@ func TestQueueFullTellsTheUserToRetry(t *testing.T) {
 	_, edits := sender.snapshot()
 	var sawBusy bool
 	for _, e := range edits {
-		if e.markdown == msgBusy {
+		if e.html == msgBusy {
 			sawBusy = true
 		}
 	}
@@ -857,8 +865,8 @@ func TestCommandIsAnsweredWithoutCallingTheModel(t *testing.T) {
 	}
 
 	answers, edits := sender.snapshot()
-	if len(answers) != 1 || answers[0] != commands.reply {
-		t.Errorf("answers = %q, want the command reply %q", answers, commands.reply)
+	if len(answers) != 1 || !strings.Contains(answers[0], "222") || !strings.Contains(answers[0], "добавлен") {
+		t.Errorf("answers = %q, want the command reply containing '222 добавлен'", answers)
 	}
 	if len(edits) != 0 {
 		t.Errorf("edits = %+v, want none: a command needs no placeholder", edits)
@@ -890,8 +898,8 @@ func TestCommandReplyShrinksAfterItsTTL(t *testing.T) {
 	if len(edits) != 1 {
 		t.Fatalf("edits = %+v, want the answer shrunk once", edits)
 	}
-	if edits[0].markdown != msgCommandExpired {
-		t.Errorf("edit = %q, want %q", edits[0].markdown, msgCommandExpired)
+	if edits[0].html != msgCommandExpired {
+		t.Errorf("edit = %q, want %q", edits[0].html, msgCommandExpired)
 	}
 	if edits[0].inlineMessageID != testInlineID {
 		t.Errorf("edit targeted %q, want the command's own message %q", edits[0].inlineMessageID, testInlineID)
@@ -970,7 +978,7 @@ func TestUnhandledCommandFallsThroughToTheModel(t *testing.T) {
 	if model.callCount() != 1 {
 		t.Error("model was not called, want ordinary questions to reach it")
 	}
-	if _, edits := sender.snapshot(); len(edits) != 1 || edits[0].markdown != model.answer {
+	if _, edits := sender.snapshot(); len(edits) != 1 || edits[0].html != model.answer {
 		t.Errorf("edits = %+v, want the model answer", edits)
 	}
 }
@@ -1125,8 +1133,8 @@ func TestDrawingWithoutASubjectAsksForOne(t *testing.T) {
 		t.Error("the generator was called with an empty prompt, want no spend")
 	}
 	answers, _ := sender.snapshot()
-	if len(answers) != 1 || answers[0] != msgEmptyDrawing {
-		t.Errorf("answers = %q, want the hint %q", answers, msgEmptyDrawing)
+	if len(answers) != 1 || !strings.Contains(answers[0], "нарисуй кота") {
+		t.Errorf("answers = %q, want the hint about drawing", answers)
 	}
 }
 
@@ -1157,7 +1165,7 @@ func TestDrawingFailureIsExplained(t *testing.T) {
 	}
 
 	_, edits := sender.snapshot()
-	if len(edits) != 1 || edits[0].markdown != msgImageFailed {
+	if len(edits) != 1 || edits[0].html != msgImageFailed {
 		t.Errorf("edits = %+v, want a single edit with %q", edits, msgImageFailed)
 	}
 	if photos, medias := sender.pictures(); len(photos) != 0 || len(medias) != 0 {
@@ -1184,7 +1192,7 @@ func TestDrawingTimeoutIsExplained(t *testing.T) {
 	}
 
 	_, edits := sender.snapshot()
-	if len(edits) != 1 || edits[0].markdown != msgImageTimeout {
+	if len(edits) != 1 || edits[0].html != msgImageTimeout {
 		t.Errorf("edits = %+v, want a single edit with %q", edits, msgImageTimeout)
 	}
 }
@@ -1199,7 +1207,7 @@ func TestParkingFailureIsExplained(t *testing.T) {
 	}
 
 	_, edits := sender.snapshot()
-	if len(edits) != 1 || edits[0].markdown != msgImageRejected {
+	if len(edits) != 1 || edits[0].html != msgImageRejected {
 		t.Errorf("edits = %+v, want a single edit with %q", edits, msgImageRejected)
 	}
 }
@@ -1214,7 +1222,7 @@ func TestRejectedMediaEditFallsBackToText(t *testing.T) {
 	}
 
 	_, edits := sender.snapshot()
-	if len(edits) != 1 || edits[0].markdown != msgImageRejected {
+	if len(edits) != 1 || edits[0].html != msgImageRejected {
 		t.Errorf("edits = %+v, want the placeholder resolved with %q", edits, msgImageRejected)
 	}
 }
@@ -1256,7 +1264,7 @@ func TestPlaceholderIsResolvedEvenIfCallerContextIsCancelled(t *testing.T) {
 	if len(edits) != 1 {
 		t.Fatalf("edits = %+v, want the placeholder resolved despite cancellation", edits)
 	}
-	if edits[0].markdown == "" {
+	if edits[0].html == "" {
 		t.Error("the placeholder was left in the chat, want it replaced")
 	}
 }
@@ -1345,6 +1353,8 @@ func (f *fakeRation) Judge(userID int64) (quota.Verdict, int, int) {
 	f.seen = append(f.seen, userID)
 	return f.verdict, 1, 30
 }
+
+func (f *fakeRation) Note(userID int64) {}
 
 func TestPublicQuestionIsServedAndCounted(t *testing.T) {
 	sender := &fakeSender{}
@@ -1526,10 +1536,9 @@ func TestDirectMessageShowsAPlaceholderThenTheAnswer(t *testing.T) {
 	if edits[0].chatID != 111 || edits[0].messageID != testDirectMessageID {
 		t.Errorf("edit targeted %d/%d, want the placeholder we just sent", edits[0].chatID, edits[0].messageID)
 	}
-	// Rich markdown is what carries headings and tables; the legacy parse mode
-	// cannot render either.
-	if edits[0].markdown != model.answer {
-		t.Errorf("edit = %q, want the answer as a rich message", edits[0].markdown)
+	// The edit is HTML-converted from the model's markdown answer.
+	if !strings.Contains(edits[0].html, "Ответ") || !strings.Contains(edits[0].html, "<b>") {
+		t.Errorf("edit = %q, want HTML with bold heading", edits[0].html)
 	}
 }
 

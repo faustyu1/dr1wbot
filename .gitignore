@@ -15,3 +15,6 @@
 
 # Local scratch.
 /test.py
+
+# Session data (user conversations stored as JSON).
+/sessions/

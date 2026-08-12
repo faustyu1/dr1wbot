@@ -16,13 +16,16 @@ import (
 	"fmt"
 	"html"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mymmrac/telego"
 
 	"dr1wbot/internal/access"
+	"dr1wbot/internal/config"
 	"dr1wbot/internal/llm"
 	"dr1wbot/internal/quota"
 	"dr1wbot/internal/settings"
@@ -59,15 +62,38 @@ type Roster interface {
 	List() []access.Entry
 }
 
+// SessionRestorer loads an archived conversation back as the active one.
+// Used by /start deep links (restore_<hash>).
+type SessionRestorer interface {
+	Restore(userID int64, hash string) error
+	HasActive(userID int64) bool
+}
+
 // Tuner is the settings the panel may change.
 type Tuner interface {
 	Get() settings.Values
 	Update(mutate func(*settings.Values)) (settings.Values, error)
+	UserPreset(userID int64) string
+	SetUserPreset(userID int64, name string) (settings.Values, error)
 }
 
 // Prober checks the keys against the live API.
 type Prober interface {
 	Probe(ctx context.Context) []llm.KeyProbe
+}
+
+// ModelPicker can list, test, and switch the active LLM models at runtime.
+type ModelPicker interface {
+	ListModels(ctx context.Context) ([]string, error)
+	TestModel(ctx context.Context, modelID string) error
+	ActiveModels() []string
+	SetModels(models []string)
+}
+
+// PromptSwitcher can report the active system-prompt preset and replace it at
+// runtime, so the panel can switch between presets without a restart.
+type PromptSwitcher interface {
+	SetSystemPrompt(prompt string)
 }
 
 // Handler serves private-chat messages and button presses.
@@ -84,6 +110,19 @@ type Handler struct {
 	botUsername string
 	imagesOn    bool
 	startedAt   time.Time
+
+	picker ModelPicker
+
+	// switcher can change the system prompt at runtime. Nil hides the preset screen.
+	switcher PromptSwitcher
+
+	// restorer loads saved sessions. Nil disables restore deep links.
+	restorer SessionRestorer
+
+	// testMu guards testResults cache from concurrent probes.
+	testMu      sync.Mutex
+	testResults map[string]bool // model → alive
+	testWhen    time.Time
 }
 
 // Options configures a Handler.
@@ -104,9 +143,18 @@ type Options struct {
 	// ImagesOn is shown on the settings screen; drawing is off by default
 	// because image generation is billed separately.
 	ImagesOn bool
+	// Picker lets the panel switch models at runtime. Nil disables the screen.
+	Picker ModelPicker
+	// Switcher lets the panel switch system-prompt presets at runtime. Nil
+	// hides the preset selector.
+	Switcher PromptSwitcher
+
 	// StartedAt is when the process came up, which is the window every counter
 	// on the stats screen covers.
 	StartedAt time.Time
+
+	// Restorer enables /start=restore_<hash> deep links. Nil ignores them.
+	Restorer SessionRestorer
 }
 
 // New builds a Handler.
@@ -126,6 +174,9 @@ func New(opts Options) *Handler {
 		botUsername: opts.BotUsername,
 		imagesOn:    opts.ImagesOn,
 		startedAt:   opts.StartedAt,
+		picker:      opts.Picker,
+		switcher:    opts.Switcher,
+		restorer:    opts.Restorer,
 	}
 }
 
@@ -140,6 +191,8 @@ const (
 	screenHelp     = "help"
 	screenCheck    = "chk"
 	screenCallers  = "who"
+	screenModels   = "mdl" // model selector screen
+	screenPresets  = "pmp" // system-prompt preset selector screen
 )
 
 // Action prefixes. An action does something and then redraws a screen, rather
@@ -150,6 +203,15 @@ const (
 	// killPublic is the stop switch: one press closes the bot to the public
 	// without cycling the limit down to zero one step at a time.
 	killPublic = "kill"
+	// selModelPrefix marks a model-selection button. The model id follows.
+	selModelPrefix = "mdl:"
+	// testModels triggers a live probe of all models.
+	testModels = "tmdl"
+	// selPresetPrefix marks a preset-selection button. The preset name follows.
+	selPresetPrefix = "psp:"
+	// Session buttons shown on /start.
+	actNewSession = "newSess"
+	actContinue   = "contSess"
 )
 
 // callersShown bounds the ban list. Telegram caps a keyboard's size, and a
@@ -193,11 +255,6 @@ var (
 // cannot be mistaken for a menu press.
 const callbackPrefix = "menu:"
 
-// sourceURL is where this program's source lives. AGPL-3.0 asks that users
-// interacting with the program over a network be told, and the help screen is
-// where that belongs. A fork should point this at its own repository.
-const sourceURL = "https://github.com/faustyu1/dr1wbot"
-
 // HandleMessage serves one private-chat message. It reports whether the
 // message was a menu command: anything else is an ordinary question, and the
 // caller answers it the same way it answers a summon. Greeting somebody who
@@ -212,18 +269,14 @@ func (h *Handler) HandleMessage(ctx context.Context, msg telego.Message) (handle
 
 	switch command {
 	case "/start", "/help":
-		var keyboard *telego.InlineKeyboardMarkup
-		if h.roster.IsAdmin(userID) {
-			keyboard = keys(row(button("⚙️ Панель", screenMain)))
-		}
-		return true, h.send(ctx, msg.Chat.ID, h.greeting(userID), keyboard)
+		return true, h.handleStart(ctx, msg)
 	case "/admin":
 		if !h.roster.IsAdmin(userID) {
 			// Saying "not an admin" would confirm the menu exists; the greeting
 			// says nothing either way.
 			return true, h.send(ctx, msg.Chat.ID, h.greeting(userID), nil)
 		}
-		text, keyboard := h.screen(screenMain)
+		text, keyboard := h.screen(screenMain, userID)
 		return true, h.send(ctx, msg.Chat.ID, text, keyboard)
 	default:
 		return false, nil
@@ -278,9 +331,68 @@ func (h *Handler) HandleCallback(ctx context.Context, query telego.CallbackQuery
 			h.log.Info("pardoned by hand", "user_id", id, "by", query.From.ID)
 		}
 		name = screenCallers
+
+	case strings.HasPrefix(name, selModelPrefix):
+		modelID := strings.TrimPrefix(name, selModelPrefix)
+		if h.picker != nil && modelID != "" {
+			active := h.picker.ActiveModels()
+			if slices.Contains(active, modelID) {
+				// Remove from active list.
+				next := make([]string, 0, len(active))
+				for _, m := range active {
+					if m != modelID {
+						next = append(next, m)
+					}
+				}
+				if len(next) == 0 {
+					next = active // never empty the list
+				}
+				h.picker.SetModels(next)
+			} else {
+				// Add to front of the list (primary model).
+				h.picker.SetModels(append([]string{modelID}, active...))
+			}
+			h.log.Info("model selection changed", "model", modelID, "active", h.picker.ActiveModels(), "by", query.From.ID)
+		}
+		name = screenModels
+
+	case name == testModels:
+		h.testAllModels(ctx)
+		name = screenModels
+
+	case strings.HasPrefix(name, selPresetPrefix):
+		presetName := strings.TrimPrefix(name, selPresetPrefix)
+		if h.tuner != nil {
+			preset := config.PresetByName(presetName)
+			if h.switcher != nil && preset.Name == "default" {
+				// default = clear the per-user override; falls back to global.
+				h.tuner.SetUserPreset(query.From.ID, "")
+			} else {
+				h.tuner.SetUserPreset(query.From.ID, preset.Name)
+			}
+			h.log.Info("system prompt preset changed", "preset", preset.Name, "by", query.From.ID)
+		}
+		name = screenPresets
+
+	case name == actNewSession || name == actContinue:
+		// These buttons don't open a screen — they send a message the user
+		// reads and then types in. We answer the callback and return early.
+		var text string
+		if name == actNewSession {
+			text = "🆕 Напишите /reset, чтобы сохранить текущую сессию и начать новую."
+		} else {
+			text = "▶️ Просто продолжайте писать — я помню контекст нашей беседы."
+		}
+		_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
+			ChatID:             telego.ChatID{ID: query.Message.GetChat().ID},
+			Text:               text,
+			ParseMode:          telego.ModeHTML,
+			LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
+		})
+		return nil
 	}
 
-	text, keyboard := h.screenContext(ctx, name)
+	text, keyboard := h.screenContext(ctx, name, query.From.ID)
 	return h.edit(ctx, query.Message.GetChat().ID, query.Message.GetMessageID(), text, keyboard)
 }
 
@@ -366,32 +478,77 @@ func (h *Handler) turn(knob string) error {
 // it they get, because both questions arrive constantly otherwise.
 func (h *Handler) greeting(userID int64) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s <b>Привет!</b>\n\n", tgemoji.Tag(tgemoji.IDBot, "🤖"))
+	fmt.Fprintf(&b, "<b>Привет!</b>\n\n")
 	fmt.Fprintf(&b, "Я отвечаю в любом чате Telegram — позови меня по имени:\n\n")
 	fmt.Fprintf(&b, "<blockquote><code>@%s объясни, что такое CAP-теорема</code></blockquote>\n\n", h.botUsername)
-	fmt.Fprintf(&b, "%s Отвечу на вопрос, разберу картинку, продолжу разговор, если ответишь мне реплаем.\n\n",
-		tgemoji.Tag(tgemoji.IDWrite, "✍️"))
+	fmt.Fprintf(&b, "Отвечу на вопрос, разберу картинку, продолжу разговор, если ответишь мне реплаем.\n\n")
 
 	switch {
 	case h.roster.IsAdmin(userID):
-		fmt.Fprintf(&b, "%s Ты админ: /admin открывает панель.", tgemoji.Tag(tgemoji.IDSettings, "⚙️"))
+		fmt.Fprintf(&b, "Ты админ: /admin открывает панель.")
 	case h.ration != nil && h.ration.Enabled():
 		used, limit := h.ration.Peek(userID)
-		fmt.Fprintf(&b, "%s Сегодня осталось <b>%d</b> из %d запросов. Счётчик обнуляется в полночь UTC.",
-			tgemoji.Tag(tgemoji.IDChart, "📊"), max(limit-used, 0), limit)
+		fmt.Fprintf(&b, "Сегодня осталось <b>%d</b> из %d запросов. Счётчик обнуляется в полночь UTC.",
+			max(limit-used, 0), limit)
 	default:
-		fmt.Fprintf(&b, "%s Бот приватный: отвечаю только тем, кто есть в списке доступа.",
-			tgemoji.Tag(tgemoji.IDLockClosed, "🔒"))
+		fmt.Fprintf(&b, "Бот приватный: отвечаю только тем, кто есть в списке доступа.")
 	}
 	return b.String()
 }
 
+// handleStart processes /start (and /help), including deep links of the form
+// /start restore_<hash> that restore an archived conversation.
+func (h *Handler) handleStart(ctx context.Context, msg telego.Message) error {
+	userID := msg.From.ID
+
+	// Parse deep link payload: "/start restore_abc123…"
+	parts := strings.Fields(msg.Text)
+	if len(parts) >= 2 {
+		if hash, ok := strings.CutPrefix(parts[1], "restore_"); ok && h.restorer != nil {
+			if err := h.restorer.Restore(userID, hash); err != nil {
+				h.log.Warn("restore failed", "err", err, "user_id", userID)
+				return h.send(ctx, msg.Chat.ID,
+					"⚠️ Не удалось восстановить сессию. Возможно, она была удалена.", nil)
+			}
+			return h.send(ctx, msg.Chat.ID,
+				"✅ <b>Сессия восстановлена.</b>\n\nПродолжаем с того места, где остановились.",
+				nil)
+		}
+	}
+
+	// Regular /start — show greeting with optional session buttons.
+	var rows [][]telego.InlineKeyboardButton
+	if h.roster.IsAdmin(userID) {
+		rows = append(rows, row(button("панель", screenMain)))
+	}
+	if h.restorer != nil {
+		var sessionRows []telego.InlineKeyboardButton
+		sessionRows = append(sessionRows, telego.InlineKeyboardButton{
+			Text:         "🆕 Новая сессия",
+			CallbackData: callbackPrefix + actNewSession,
+		})
+		if h.restorer.HasActive(userID) {
+			sessionRows = append(sessionRows, telego.InlineKeyboardButton{
+				Text:         "▶️ Продолжить",
+				CallbackData: callbackPrefix + actContinue,
+			})
+		}
+		rows = append(rows, sessionRows)
+	}
+
+	var keyboard *telego.InlineKeyboardMarkup
+	if len(rows) > 0 {
+		keyboard = keys(rows...)
+	}
+	return h.send(ctx, msg.Chat.ID, h.greeting(userID), keyboard)
+}
+
 // screenContext renders a page that may need to call out to the network.
-func (h *Handler) screenContext(ctx context.Context, name string) (string, *telego.InlineKeyboardMarkup) {
+func (h *Handler) screenContext(ctx context.Context, name string, userID int64) (string, *telego.InlineKeyboardMarkup) {
 	if name == screenCheck {
 		return h.checkScreen(ctx)
 	}
-	return h.screen(name)
+	return h.screen(name, userID)
 }
 
 // callersScreen lists today's public users with a button each. This is the only
@@ -399,16 +556,16 @@ func (h *Handler) screenContext(ctx context.Context, name string) (string, *tele
 // id into, so every actionable person has to be one the bot already knows.
 func (h *Handler) callersScreen() (string, *telego.InlineKeyboardMarkup) {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s <b>Кто сегодня писал</b>\n\n", tgemoji.Tag(tgemoji.IDPeople, "👥"))
+	fmt.Fprintf(&b, "<b>Кто сегодня писал</b>\n\n")
 
-	if h.ration == nil || !h.ration.Enabled() {
-		fmt.Fprintf(&b, "%s Публичный доступ выключен — списка нет.", tgemoji.Tag(tgemoji.IDLockClosed, "🔒"))
+	if h.ration == nil {
+		fmt.Fprintf(&b, "Статистика недоступна.")
 		return b.String(), keys(row(backButton()))
 	}
 
 	callers := h.ration.Callers(callersShown)
 	if len(callers) == 0 {
-		fmt.Fprintf(&b, "%s Сегодня никого.", tgemoji.Tag(tgemoji.IDInfo, "ℹ️"))
+		fmt.Fprintf(&b, "Сегодня никого.")
 		return b.String(), keys(row(backButton()))
 	}
 
@@ -416,16 +573,16 @@ func (h *Handler) callersScreen() (string, *telego.InlineKeyboardMarkup) {
 	for _, c := range callers {
 		switch {
 		case c.Forever:
-			fmt.Fprintf(&b, "%s <code>%d</code> — <b>бан навсегда</b>, варнов %d\n",
-				tgemoji.Tag(tgemoji.IDUserNo, "🚫"), c.ID, c.Warns)
+			fmt.Fprintf(&b, "<code>%d</code> — <b>бан навсегда</b>, варнов %d\n",
+				c.ID, c.Warns)
 			rows = append(rows, row(action(fmt.Sprintf("✅ Разбанить %d", c.ID), pardonPrefix+idText(c.ID))))
 		case !c.Until.IsZero():
-			fmt.Fprintf(&b, "%s <code>%d</code> — бан ещё <b>%s</b>, варнов %d\n",
-				tgemoji.Tag(tgemoji.IDUserNo, "🚫"), c.ID, shortDuration(time.Until(c.Until)), c.Warns)
+			fmt.Fprintf(&b, "<code>%d</code> — бан ещё <b>%s</b>, варнов %d\n",
+				c.ID, shortDuration(time.Until(c.Until)), c.Warns)
 			rows = append(rows, row(action(fmt.Sprintf("✅ Разбанить %d", c.ID), pardonPrefix+idText(c.ID))))
 		default:
-			fmt.Fprintf(&b, "%s <code>%d</code> — %d из %d",
-				tgemoji.Tag(tgemoji.IDUserOK, "👤"), c.ID, c.Used, c.Limit)
+			fmt.Fprintf(&b, "<code>%d</code> — %d из %d",
+				c.ID, c.Used, c.Limit)
 			if c.Warns > 0 {
 				fmt.Fprintf(&b, ", варнов %d", c.Warns)
 			}
@@ -434,8 +591,8 @@ func (h *Handler) callersScreen() (string, *telego.InlineKeyboardMarkup) {
 		}
 	}
 
-	fmt.Fprintf(&b, "\n%s <i>Забаненные сверху. Автоматический бан выдаётся за скорость; "+
-		"кнопка — для тех, кто мешает в человеческом темпе.</i>", tgemoji.Tag(tgemoji.IDInfo, "ℹ️"))
+	fmt.Fprintf(&b, "\n<i>Забаненные сверху. Автоматический бан выдаётся за скорость; "+
+		"кнопка — для тех, кто мешает в человеческом темпе.</i>")
 
 	rows = append(rows, row(backButton()))
 	return b.String(), keys(rows...)
@@ -445,7 +602,7 @@ func idText(id int64) string { return strconv.FormatInt(id, 10) }
 
 // screen renders one menu page. An unknown name falls back to the main screen,
 // which is what an old message with a stale button should do.
-func (h *Handler) screen(name string) (string, *telego.InlineKeyboardMarkup) {
+func (h *Handler) screen(name string, userID int64) (string, *telego.InlineKeyboardMarkup) {
 	switch name {
 	case screenLimits:
 		return h.limitsScreen()
@@ -459,6 +616,10 @@ func (h *Handler) screen(name string) (string, *telego.InlineKeyboardMarkup) {
 		return h.helpScreen()
 	case screenCallers:
 		return h.callersScreen()
+	case screenModels:
+		return h.modelsScreen()
+	case screenPresets:
+		return h.presetsScreen(userID)
 	default:
 		return h.mainScreen()
 	}
@@ -468,16 +629,17 @@ func (h *Handler) mainScreen() (string, *telego.InlineKeyboardMarkup) {
 	stats := h.models.Stats()
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s <b>Панель управления</b>\n\n", tgemoji.Tag(tgemoji.IDSettings, "⚙️"))
-	fmt.Fprintf(&b, "%s Ключи: <b>%d</b> из %d свободны\n",
-		health(stats.Keys.Ready), stats.Keys.Ready, stats.Keys.Total)
-	fmt.Fprintf(&b, "%s Ответов за сессию: <b>%d</b>\n", tgemoji.Tag(tgemoji.IDGrowth, "📈"), answered(stats))
-	fmt.Fprintf(&b, "%s Аптайм: <b>%s</b>", tgemoji.Tag(tgemoji.IDClock, "⏰"), shortDuration(time.Since(h.startedAt)))
+	fmt.Fprintf(&b, "<b>Панель управления</b>\n\n")
+	fmt.Fprintf(&b, "Ключи: <b>%d</b> из %d свободны\n",
+		stats.Keys.Ready, stats.Keys.Total)
+	fmt.Fprintf(&b, "Ответов за сессию: <b>%d</b>\n", answered(stats))
+	fmt.Fprintf(&b, "Аптайм: <b>%s</b>", shortDuration(time.Since(h.startedAt)))
 
 	return b.String(), keys(
-		row(button("📊 Лимиты", screenLimits), button("📈 Статистика", screenStats)),
-		row(button("👥 Доступ", screenPeople), button("⚙️ Настройки", screenSettings)),
-		row(button("🚫 Кто писал", screenCallers), button("ℹ️ Справка", screenHelp)),
+		row(button("лимиты", screenLimits), button("статистика", screenStats)),
+		row(button("доступ", screenPeople), button("настройки", screenSettings)),
+		row(button("модели", screenModels), button("промпт", screenPresets)),
+		row(button("кто писал", screenCallers), button("справка", screenHelp)),
 	)
 }
 
@@ -485,38 +647,32 @@ func (h *Handler) limitsScreen() (string, *telego.InlineKeyboardMarkup) {
 	stats := h.models.Stats()
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s <b>Лимиты и ключи</b>\n\n", tgemoji.Tag(tgemoji.IDChart, "📊"))
+	fmt.Fprintf(&b, "<b>Лимиты и ключи</b>\n\n")
 
 	fmt.Fprintf(&b, "<b>Ключи API</b>\n")
-	fmt.Fprintf(&b, "%s Свободны: <b>%d</b>\n", tgemoji.Tag(tgemoji.IDLockOpen, "🔓"), stats.Keys.Ready)
-	fmt.Fprintf(&b, "%s Остывают: <b>%d</b>\n", tgemoji.Tag(tgemoji.IDLockClosed, "🔒"), stats.Keys.Parked)
+	fmt.Fprintf(&b, "Свободны: <b>%d</b>\n", stats.Keys.Ready)
+	fmt.Fprintf(&b, "Остывают: <b>%d</b>\n", stats.Keys.Parked)
 	if !stats.Keys.NextReady.IsZero() {
-		fmt.Fprintf(&b, "%s Ближайший вернётся через <b>%s</b>\n",
-			tgemoji.Tag(tgemoji.IDElapsed, "🕓"), shortDuration(time.Until(stats.Keys.NextReady)))
+		fmt.Fprintf(&b, "Ближайший вернётся через <b>%s</b>\n",
+			shortDuration(time.Until(stats.Keys.NextReady)))
 	}
 
 	fmt.Fprintf(&b, "\n<b>Модели</b> (в порядке фолбэка)\n")
-	for i, m := range stats.Models {
-		mark := tgemoji.Tag(tgemoji.IDCheck, "✅")
-		if i > 0 && m.Answers > 0 {
-			// Answers on a fallback model mean the one above it ran dry.
-			mark = tgemoji.Tag(tgemoji.IDBell, "🔔")
-		}
-		fmt.Fprintf(&b, "%s <code>%s</code> — <b>%d</b>\n", mark, m.Name, m.Answers)
+	for _, m := range stats.Models {
+		fmt.Fprintf(&b, "<code>%s</code> — <b>%d</b>\n", m.Name, m.Answers)
 	}
 
 	if stats.QuotaOut > 0 {
-		fmt.Fprintf(&b, "\n%s Упёрлись в лимиты <b>%d</b> раз: ни один ключ не ответил ни на одной модели.\n",
-			tgemoji.Tag(tgemoji.IDCross, "❌"), stats.QuotaOut)
+		fmt.Fprintf(&b, "\nУпёрлись в лимиты <b>%d</b> раз: ни один ключ не ответил ни на одной модели.\n",
+			stats.QuotaOut)
 	}
 
-	fmt.Fprintf(&b, "\n%s <i>Остаток квоты через API не отдаёт — эндпоинта для этого нет. "+
+	fmt.Fprintf(&b, "\n<i>Остаток квоты через API не отдаёт — эндпоинта для этого нет. "+
 		"Здесь только то, что бот увидел сам с момента запуска. «Проверить ключи» дёргает список "+
-		"моделей каждым ключом: это бесплатно и показывает, какие ключи вообще живы.</i>",
-		tgemoji.Tag(tgemoji.IDInfo, "ℹ️"))
+		"моделей каждым ключом: это бесплатно и показывает, какие ключи вообще живы.</i>")
 
 	return b.String(), keys(
-		row(button("👁 Проверить ключи", screenCheck)),
+		row(button("проверить ключи", screenCheck)),
 		row(backButton()),
 	)
 }
@@ -526,7 +682,7 @@ func (h *Handler) limitsScreen() (string, *telego.InlineKeyboardMarkup) {
 // close to "what are my limits" as it gets.
 func (h *Handler) checkScreen(ctx context.Context) (string, *telego.InlineKeyboardMarkup) {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s <b>Проверка ключей</b>\n\n", tgemoji.Tag(tgemoji.IDEye, "👁"))
+	fmt.Fprintf(&b, "<b>Проверка ключей</b>\n\n")
 
 	if h.prober == nil {
 		fmt.Fprintf(&b, "Проверка недоступна.")
@@ -540,21 +696,20 @@ func (h *Handler) checkScreen(ctx context.Context) (string, *telego.InlineKeyboa
 	for _, p := range h.prober.Probe(probeCtx) {
 		if p.Err == nil {
 			alive++
-			fmt.Fprintf(&b, "%s Ключ %d — <b>%d моделей</b>\n",
-				tgemoji.Tag(tgemoji.IDCheck, "✅"), p.Index+1, p.Models)
+			fmt.Fprintf(&b, "Ключ %d — <b>%d моделей</b>\n",
+				p.Index+1, p.Models)
 			continue
 		}
-		fmt.Fprintf(&b, "%s Ключ %d — <code>%s</code>\n",
-			tgemoji.Tag(tgemoji.IDCross, "❌"), p.Index+1, escape(p.Err.Error()))
+		fmt.Fprintf(&b, "Ключ %d — <code>%s</code>\n",
+			p.Index+1, escape(p.Err.Error()))
 	}
 
-	fmt.Fprintf(&b, "\n%s Живых ключей: <b>%d</b>\n", tgemoji.Tag(tgemoji.IDLockOpen, "🔓"), alive)
-	fmt.Fprintf(&b, "\n%s <i>Сам список моделей квоту не тратит. Ключ, который отвечает здесь, "+
-		"всё ещё может упереться в лимит на генерации — это разные счётчики.</i>",
-		tgemoji.Tag(tgemoji.IDInfo, "ℹ️"))
+	fmt.Fprintf(&b, "\nЖивых ключей: <b>%d</b>\n", alive)
+	fmt.Fprintf(&b, "\n<i>Сам список моделей квоту не тратит. Ключ, который отвечает здесь, "+
+		"всё ещё может упереться в лимит на генерации — это разные счётчики.</i>")
 
 	return b.String(), keys(
-		row(button("🔄 Ещё раз", screenCheck)),
+		row(button("ещё раз", screenCheck)),
 		row(backButton()),
 	)
 }
@@ -568,18 +723,18 @@ func (h *Handler) statsScreen() (string, *telego.InlineKeyboardMarkup) {
 	stats := h.models.Stats()
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s <b>Статистика</b>\n\n", tgemoji.Tag(tgemoji.IDGrowth, "📈"))
-	fmt.Fprintf(&b, "%s Запросов к модели: <b>%d</b>\n", tgemoji.Tag(tgemoji.IDWrite, "✍️"), stats.Requests)
-	fmt.Fprintf(&b, "%s Ответов: <b>%d</b>\n", tgemoji.Tag(tgemoji.IDCheck, "✅"), answered(stats))
-	fmt.Fprintf(&b, "%s Неудач: <b>%d</b>\n", tgemoji.Tag(tgemoji.IDCross, "❌"), stats.Failures)
-	fmt.Fprintf(&b, "%s Аптайм: <b>%s</b>\n", tgemoji.Tag(tgemoji.IDClock, "⏰"), shortDuration(time.Since(h.startedAt)))
+	fmt.Fprintf(&b, "<b>Статистика</b>\n\n")
+	fmt.Fprintf(&b, "Запросов к модели: <b>%d</b>\n", stats.Requests)
+	fmt.Fprintf(&b, "Ответов: <b>%d</b>\n", answered(stats))
+	fmt.Fprintf(&b, "Неудач: <b>%d</b>\n", stats.Failures)
+	fmt.Fprintf(&b, "Аптайм: <b>%s</b>\n", shortDuration(time.Since(h.startedAt)))
 
 	if h.ration != nil && h.ration.Enabled() {
 		q := h.ration.Stats()
-		fmt.Fprintf(&b, "\n%s <b>Публичный доступ сегодня</b>\n", tgemoji.Tag(tgemoji.IDMegaphone, "📣"))
-		fmt.Fprintf(&b, "%s Людей: <b>%d</b>\n", tgemoji.Tag(tgemoji.IDPeople, "👥"), q.Users)
-		fmt.Fprintf(&b, "%s Запросов: <b>%d</b>\n", tgemoji.Tag(tgemoji.IDChart, "📊"), q.Requests)
-		fmt.Fprintf(&b, "%s Обнуление через <b>%s</b>", tgemoji.Tag(tgemoji.IDCalendar, "📅"), shortDuration(q.ResetsIn))
+		fmt.Fprintf(&b, "\n<b>Публичный доступ сегодня</b>\n")
+		fmt.Fprintf(&b, "Людей: <b>%d</b>\n", q.Users)
+		fmt.Fprintf(&b, "Запросов: <b>%d</b>\n", q.Requests)
+		fmt.Fprintf(&b, "Обнуление через <b>%s</b>", shortDuration(q.ResetsIn))
 	}
 
 	return b.String(), keys(row(backButton()))
@@ -589,10 +744,10 @@ func (h *Handler) peopleScreen() (string, *telego.InlineKeyboardMarkup) {
 	entries := h.roster.List()
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s <b>Доступ</b>\n\n", tgemoji.Tag(tgemoji.IDPeople, "👥"))
+	fmt.Fprintf(&b, "<b>Доступ</b>\n\n")
 
 	if len(entries) == 0 {
-		fmt.Fprintf(&b, "%s Список пуст — значит, отвечаю всем подряд.\n", tgemoji.Tag(tgemoji.IDLockOpen, "🔓"))
+		fmt.Fprintf(&b, "Список пуст — значит, отвечаю всем подряд.\n")
 	}
 
 	var admins, users, chats []string
@@ -611,12 +766,12 @@ func (h *Handler) peopleScreen() (string, *telego.InlineKeyboardMarkup) {
 		}
 	}
 
-	section(&b, tgemoji.Tag(tgemoji.IDProfile, "👤"), "Админы", admins)
-	section(&b, tgemoji.Tag(tgemoji.IDUserOK, "👤"), "Люди", users)
-	section(&b, tgemoji.Tag(tgemoji.IDHouse, "🏘"), "Чаты", chats)
+	section(&b, "", "Админы", admins)
+	section(&b, "", "Люди", users)
+	section(&b, "", "Чаты", chats)
 
-	fmt.Fprintf(&b, "\n%s Менять список — командами <code>/add id</code> и <code>/del id</code> "+
-		"в любом чате. Записи из <code>.env</code> так не убрать.", tgemoji.Tag(tgemoji.IDWrite, "✍️"))
+	fmt.Fprintf(&b, "\nМенять список — командами <code>/add id</code> и <code>/del id</code> "+
+		"в любом чате. Записи из <code>.env</code> так не убрать.")
 
 	return b.String(), keys(row(backButton()))
 }
@@ -625,16 +780,16 @@ func (h *Handler) settingsScreen() (string, *telego.InlineKeyboardMarkup) {
 	stats := h.models.Stats()
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s <b>Настройки</b>\n\n", tgemoji.Tag(tgemoji.IDSettings, "⚙️"))
+	fmt.Fprintf(&b, "<b>Настройки</b>\n\n")
 
 	models := make([]string, 0, len(stats.Models))
 	for _, m := range stats.Models {
 		models = append(models, m.Name)
 	}
-	fmt.Fprintf(&b, "%s Модели: <code>%s</code>\n", tgemoji.Tag(tgemoji.IDCode, "🔨"), strings.Join(models, ", "))
-	fmt.Fprintf(&b, "%s Ключей в пуле: <b>%d</b>\n", tgemoji.Tag(tgemoji.IDLockOpen, "🔓"), stats.Keys.Total)
+	fmt.Fprintf(&b, "Модели: <code>%s</code>\n", strings.Join(models, ", "))
+	fmt.Fprintf(&b, "Ключей в пуле: <b>%d</b>\n", stats.Keys.Total)
 
-	fmt.Fprintf(&b, "%s Картинки: %s\n", tgemoji.Tag(tgemoji.IDEye, "👁"), onOff(h.imagesOn))
+	fmt.Fprintf(&b, "Картинки: %s\n", onOff(h.imagesOn))
 	fmt.Fprintf(&b, "<i>Это из <code>.env</code>: меняется только перезапуском.</i>\n")
 
 	if h.tuner == nil {
@@ -642,49 +797,49 @@ func (h *Handler) settingsScreen() (string, *telego.InlineKeyboardMarkup) {
 	}
 	v := h.tuner.Get()
 
-	fmt.Fprintf(&b, "\n%s <b>Публичный доступ</b>\n", tgemoji.Tag(tgemoji.IDMegaphone, "📣"))
+	fmt.Fprintf(&b, "\n<b>Публичный доступ</b>\n")
 	if v.PublicDailyLimit > 0 {
-		fmt.Fprintf(&b, "%s Лимит: <b>%d запросов в сутки</b> на человека\n",
-			tgemoji.Tag(tgemoji.IDChart, "📊"), v.PublicDailyLimit)
+		fmt.Fprintf(&b, "Лимит: <b>%d запросов в сутки</b> на человека\n",
+			v.PublicDailyLimit)
 	} else {
-		fmt.Fprintf(&b, "%s Выключен — отвечаю только по списку\n", tgemoji.Tag(tgemoji.IDLockClosed, "🔒"))
+		fmt.Fprintf(&b, "Выключен — отвечаю только по списку\n")
 	}
-	fmt.Fprintf(&b, "%s Всплеск: <b>%d за %s</b>, дальше бан\n",
-		tgemoji.Tag(tgemoji.IDElapsed, "🕓"), v.Burst, shortDuration(v.BurstWindow))
-	fmt.Fprintf(&b, "%s Первый бан: <b>%s</b>, каждый следующий вдвое дольше\n",
-		tgemoji.Tag(tgemoji.IDCross, "❌"), shortDuration(v.BanFor))
+	fmt.Fprintf(&b, "Всплеск: <b>%d за %s</b>, дальше бан\n",
+		v.Burst, shortDuration(v.BurstWindow))
+	fmt.Fprintf(&b, "Первый бан: <b>%s</b>, каждый следующий вдвое дольше\n",
+		shortDuration(v.BanFor))
 	if v.GlobalDailyLimit > 0 {
-		fmt.Fprintf(&b, "%s Потолок на весь бот: <b>%d запросов в сутки</b>\n",
-			tgemoji.Tag(tgemoji.IDGrowth, "📈"), v.GlobalDailyLimit)
+		fmt.Fprintf(&b, "Потолок на весь бот: <b>%d запросов в сутки</b>\n",
+			v.GlobalDailyLimit)
 	} else {
-		fmt.Fprintf(&b, "%s Потолок на весь бот: <b>без ограничения</b>\n",
-			tgemoji.Tag(tgemoji.IDGrowth, "📈"))
+		fmt.Fprintf(&b, "Потолок на весь бот: <b>без ограничения</b>\n")
 	}
 	if v.NewAccountThreshold > 0 {
-		fmt.Fprintf(&b, "%s Свежим аккаунтам (id ≥ %d) — половина лимита\n",
-			tgemoji.Tag(tgemoji.IDUserNo, "👤"), v.NewAccountThreshold)
+		fmt.Fprintf(&b, "Свежим аккаунтам (id ≥ %d) — половина лимита\n",
+			v.NewAccountThreshold)
 	}
-	fmt.Fprintf(&b, "%s Ответ публике: до <b>%d токенов</b>\n",
-		tgemoji.Tag(tgemoji.IDWrite, "✍️"), v.PublicMaxTokens)
-	fmt.Fprintf(&b, "%s Вопрос публики: до <b>%d символов</b>\n",
-		tgemoji.Tag(tgemoji.IDCode, "🔨"), v.PublicMaxRunes)
+	fmt.Fprintf(&b, "Ответ: до <b>%d токенов</b>\n",
+		v.PublicMaxTokens)
+	fmt.Fprintf(&b, "Вопрос: до <b>%d символов</b> (для публики)\n",
+		v.PublicMaxRunes)
 
-	fmt.Fprintf(&b, "\n%s <b>Прочее</b>\n", tgemoji.Tag(tgemoji.IDSettings, "⚙️"))
+	fmt.Fprintf(&b, "\n<b>Прочее</b>\n")
 	if v.CacheTTL > 0 {
-		fmt.Fprintf(&b, "%s Кэш одинаковых вопросов: <b>%s</b>\n",
-			tgemoji.Tag(tgemoji.IDClock, "⏰"), shortDuration(v.CacheTTL))
+		fmt.Fprintf(&b, "Кэш одинаковых вопросов: <b>%s</b>\n",
+			shortDuration(v.CacheTTL))
 	} else {
-		fmt.Fprintf(&b, "%s Кэш одинаковых вопросов: <b>выключен</b>\n",
-			tgemoji.Tag(tgemoji.IDClock, "⏰"))
+		fmt.Fprintf(&b, "Кэш одинаковых вопросов: <b>выключен</b>\n")
 	}
-	fmt.Fprintf(&b, "%s Флаг <code>-s</code> для админов: %s\n",
-		tgemoji.Tag(tgemoji.IDSettings, "⚙️"), onOff(v.RawFlagEnabled))
+	fmt.Fprintf(&b, "Флаг <code>-s</code> для админов: %s\n",
+		onOff(v.RawFlagEnabled))
 
-	fmt.Fprintf(&b, "\n%s <i>Кнопки перебирают значения по кругу. Изменения применяются "+
+	fmt.Fprintf(&b, "\n<i>Кнопки перебирают значения по кругу. Изменения применяются "+
 		"сразу и переживают перезапуск — с этого момента <code>.env</code> для них "+
-		"уже не читается.</i>", tgemoji.Tag(tgemoji.IDInfo, "ℹ️"))
+		"уже не читается.</i>")
 
 	return b.String(), keys(
+		row(button("модели", screenModels),
+			button("промпт", screenPresets)),
 		row(action(killLabel(v.PublicDailyLimit), killPublic)),
 		row(edit(fmt.Sprintf("📊 Лимит: %s", limitLabel(v.PublicDailyLimit)), knobLimit),
 			edit(fmt.Sprintf("📈 Всего: %s", limitLabel(v.GlobalDailyLimit)), knobGlobal)),
@@ -730,9 +885,204 @@ func cacheLabel(d time.Duration) string {
 	return shortDuration(d)
 }
 
+// modelsScreen shows available LLM models from the API and lets the admin
+// toggle which ones are active. Active models form the fallback chain:
+// the first one is tried first, then the next, etc.
+func (h *Handler) modelsScreen() (string, *telego.InlineKeyboardMarkup) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "<b>Модели</b>\n\n")
+
+	if h.picker == nil {
+		fmt.Fprintf(&b, "Селектор моделей недоступен.")
+		return b.String(), keys(row(backButton()))
+	}
+
+	active := h.picker.ActiveModels()
+	activeSet := make(map[string]bool, len(active))
+	for _, m := range active {
+		activeSet[m] = true
+	}
+
+	// Fetch the model list from the API.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	available, err := h.picker.ListModels(ctx)
+	if err != nil {
+		fmt.Fprintf(&b, "Не удалось получить список: <code>%s</code>\n",
+			html.EscapeString(err.Error()))
+		return b.String(), keys(row(backButton()))
+	}
+
+	if len(available) == 0 {
+		fmt.Fprintf(&b, "Модели не найдены.")
+		return b.String(), keys(row(backButton()))
+	}
+
+	slices.Sort(available)
+
+	// Show cached test results if available.
+	h.testMu.Lock()
+	results := h.testResults
+	age := time.Since(h.testWhen)
+	h.testMu.Unlock()
+
+	fmt.Fprintf(&b, "Всего: <b>%d</b>", len(available))
+	if results != nil && age < 5*time.Minute {
+		alive := 0
+		for _, ok := range results {
+			if ok {
+				alive++
+			}
+		}
+		fmt.Fprintf(&b, " | Живых: <b>%d</b>", alive)
+	}
+	fmt.Fprintf(&b, "\nАктивно в боте: <b>%d</b>\n", len(active))
+
+	// Show active model order.
+	for i, m := range active {
+		fmt.Fprintf(&b, "%d. <code>%s</code>\n", i+1, m)
+	}
+	fmt.Fprintf(&b, "\n")
+
+	// Build buttons: one per model showing its toggle state and test status.
+	rows := make([][]telego.InlineKeyboardButton, 0, len(available)+3)
+	for _, m := range available {
+		label := m
+		if activeSet[m] {
+			order := 1
+			for i, am := range active {
+				if am == m {
+					order = i + 1
+					break
+				}
+			}
+			label = fmt.Sprintf("✅ %d│ %s", order, m)
+		} else {
+			label = fmt.Sprintf("⚪️ │ %s", m)
+		}
+		// Mark dead models.
+		if results != nil {
+			if ok, found := results[m]; found && !ok {
+				label = "❌ " + label
+			}
+		}
+		rows = append(rows, row(action(label, selModelPrefix+m)))
+	}
+
+	rows = append(rows, row(button("проверить все", testModels)))
+	rows = append(rows, row(backButton()))
+
+	return b.String(), keys(rows...)
+}
+
+// presetsScreen shows the system-prompt preset selector. The operator picks one
+// of the fixed presets defined in config; the change applies immediately.
+func (h *Handler) presetsScreen(userID int64) (string, *telego.InlineKeyboardMarkup) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "<b>Промпт</b>\n\n")
+
+	presets := config.SystemPresets
+	active := h.tuner.UserPreset(userID)
+	if active == "" {
+		active = "default"
+	}
+
+	for _, p := range presets {
+		mark := "⚪️"
+		if p.Name == active {
+			mark = "✅"
+		}
+		fmt.Fprintf(&b, "%s <b>%s</b> — %s\n", mark, p.Name, p.Desc)
+	}
+
+	fmt.Fprintf(&b, "\n<i>Переключается мгновенно. Пресет «default» — стандартное поведение.</i>")
+
+	rows := make([][]telego.InlineKeyboardButton, 0, len(presets)+1)
+	for _, p := range presets {
+		label := p.Desc
+		if p.Name == active {
+			label = "✅ " + label
+		}
+		rows = append(rows, row(action(label, selPresetPrefix+p.Name)))
+	}
+	rows = append(rows, row(backButton()))
+
+	return b.String(), keys(rows...)
+}
+
+// testAllModels probes every available model with a minimal request and caches
+// the results so the screen can show ✅/❌ without re-testing on every render.
+func (h *Handler) testAllModels(ctx context.Context) {
+	if h.picker == nil {
+		return
+	}
+
+	listCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	available, err := h.picker.ListModels(listCtx)
+	cancel()
+	if err != nil || len(available) == 0 {
+		return
+	}
+
+	slices.Sort(available)
+
+	// Test each model with a generous timeout. Models are tested sequentially
+	// to avoid hammering the API with 20+ concurrent requests.
+	results := make(map[string]bool, len(available))
+	for _, m := range available {
+		testCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err := h.picker.TestModel(testCtx, m)
+		cancel()
+		results[m] = (err == nil)
+	}
+
+	// Only keep models that actually responded.
+	live := make([]string, 0, len(results))
+	for m, ok := range results {
+		if ok {
+			live = append(live, m)
+		}
+	}
+
+	h.testMu.Lock()
+	h.testResults = results
+	h.testWhen = time.Now()
+	h.testMu.Unlock()
+
+	// Auto-activate the live models, sorted, preserving any current order
+	// for models that were already active.
+	currentActive := h.picker.ActiveModels()
+	activeSet := make(map[string]bool, len(currentActive))
+	for _, m := range currentActive {
+		activeSet[m] = true
+	}
+
+	// New active list: keep currently active ones that are still alive,
+	// then append newly discovered live models.
+	newActive := make([]string, 0, len(live))
+	for _, m := range currentActive {
+		if results[m] { // still alive
+			newActive = append(newActive, m)
+		}
+	}
+	for _, m := range available {
+		if results[m] && !activeSet[m] {
+			newActive = append(newActive, m)
+		}
+	}
+	if len(newActive) > 0 {
+		h.picker.SetModels(newActive)
+	}
+
+	h.log.Info("model probe complete",
+		"total", len(available),
+		"alive", len(live),
+		"active", h.picker.ActiveModels())
+}
+
 func (h *Handler) helpScreen() (string, *telego.InlineKeyboardMarkup) {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s <b>Справка</b>\n\n", tgemoji.Tag(tgemoji.IDInfo, "ℹ️"))
+	fmt.Fprintf(&b, "<b>Справка</b>\n\n")
 	fmt.Fprintf(&b, "<b>Команды</b> — работают в любом чате, где бота позвали:\n")
 	fmt.Fprintf(&b, "<code>/add id</code> — выдать доступ\n")
 	fmt.Fprintf(&b, "<code>/del id</code> — забрать\n")
@@ -740,14 +1090,7 @@ func (h *Handler) helpScreen() (string, *telego.InlineKeyboardMarkup) {
 	fmt.Fprintf(&b, "<b>Флаг <code>-s</code></b> — первым словом в вопросе снимает домашний стиль ответа:\n")
 	fmt.Fprintf(&b, "<blockquote><code>@%s -s распиши подробно, ничего не сокращай</code></blockquote>\n\n",
 		h.botUsername)
-	fmt.Fprintf(&b, "%s Положительный id — человек, отрицательный — группа или канал.\n\n",
-		tgemoji.Tag(tgemoji.IDInfo, "ℹ️"))
-
-	// AGPL asks that a program offered over a network tell its users where the
-	// source is. This is that notice, and it is also just useful.
-	fmt.Fprintf(&b, "%s Исходники: %s\nЛицензия AGPL-3.0 — пользоваться и продавать можно, "+
-		"свой форк обязан остаться открытым.",
-		tgemoji.Tag(tgemoji.IDCode, "🔨"), sourceURL)
+	fmt.Fprintf(&b, "Положительный id — человек, отрицательный — группа или канал.\n")
 
 	return b.String(), keys(row(backButton()))
 }
@@ -800,11 +1143,11 @@ func (h *Handler) edit(ctx context.Context, chatID int64, messageID int, text st
 }
 
 // section appends a titled list, or nothing when the list is empty.
-func section(b *strings.Builder, icon, title string, lines []string) {
+func section(b *strings.Builder, _ string, title string, lines []string) {
 	if len(lines) == 0 {
 		return
 	}
-	fmt.Fprintf(b, "\n%s <b>%s</b>\n", icon, title)
+	fmt.Fprintf(b, "\n<b>%s</b>\n", title)
 	for _, line := range lines {
 		fmt.Fprintf(b, "%s\n", line)
 	}
@@ -814,9 +1157,9 @@ func section(b *strings.Builder, icon, title string, lines []string) {
 // state an operator needs to spot at a glance.
 func health(ready int) string {
 	if ready == 0 {
-		return tgemoji.Tag(tgemoji.IDLockClosed, "🔒")
+		return ""
 	}
-	return tgemoji.Tag(tgemoji.IDLockOpen, "🔓")
+	return ""
 }
 
 func answered(s llm.Stats) int {
@@ -883,7 +1226,7 @@ func edit(label, knob string) telego.InlineKeyboardButton {
 }
 
 func backButton() telego.InlineKeyboardButton {
-	return button("◁ Назад", screenMain)
+	return button("назад", screenMain)
 }
 
 func row(buttons ...telego.InlineKeyboardButton) []telego.InlineKeyboardButton {

@@ -17,6 +17,8 @@ require (
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasthttp v1.72.0 // indirect
 	github.com/valyala/fastjson v1.6.10 // indirect
+	github.com/yuin/goldmark v1.8.5 // indirect
 	golang.org/x/arch v0.0.0-20210923205945-b76863e36670 // indirect
-	golang.org/x/sys v0.46.0 // indirect
+	golang.org/x/net v0.57.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 )

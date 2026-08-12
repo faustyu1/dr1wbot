@@ -17,7 +17,9 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,8 +37,13 @@ import (
 	"dr1wbot/internal/menu"
 	"dr1wbot/internal/quota"
 	"dr1wbot/internal/reply"
+	"dr1wbot/internal/search"
+	"dr1wbot/internal/session"
 	"dr1wbot/internal/settings"
+	"dr1wbot/internal/tgchannel"
 	"dr1wbot/internal/tgfile"
+	"dr1wbot/internal/tools"
+	"dr1wbot/internal/transcribe"
 )
 
 // shutdownGrace is how long in-flight answers get to finish after a signal.
@@ -180,30 +187,108 @@ func run() error {
 		Timeout:         cfg.Timeout,
 	})
 
+	// The executor wraps the model with a tool-calling loop. When no tools are
+	// configured it is a pure pass-through, so existing deployments keep working.
+	var completer llm.Completer = model
+	if cfg.SearchEnabled || cfg.TGChannelEnabled {
+		var searcher *search.Searcher
+		if cfg.SearchEnabled {
+			searcher = search.New(search.Options{
+				PaxsenixKey: cfg.PaxsenixKey,
+				PaxsenixURL: cfg.PaxsenixURL,
+				SearxngURL:  cfg.SearxngURL,
+				Timeout:     cfg.Timeout,
+				Log:         log,
+			})
+			log.Info("web search enabled",
+				"backend", searchBackend(cfg),
+				"paxsenix", cfg.PaxsenixKey != "",
+				"searxng_fallback", cfg.SearxngURL != "")
+		}
+
+		var tgreader *tgchannel.Reader
+		if cfg.TGChannelEnabled {
+			tgreader = tgchannel.New(tgchannel.Options{
+				Timeout: cfg.Timeout,
+				Log:     log,
+			})
+			log.Info("telegram channel reading enabled")
+		}
+
+		completer = tools.New(tools.Options{
+			Model:    model,
+			Search:   searcher,
+			TGReader: tgreader,
+			Log:      log,
+		})
+	}
+
+	// A persistent, compression-aware session store for private chats. Every
+	// user gets their own per-user context file (sessions/{userID}.json) with
+	// git auto-commit so the data is versioned and can be pushed to a private
+	// remote for backup. The summariser uses the raw LLM client (not the
+	// tool-wrapped executor) so compression calls are quick and never trigger
+	// tool loops.
+	var dmStore *session.Store
+	{
+		sessionDir := filepath.Join(filepath.Dir(cfg.StateFile), "sessions")
+		summariser := session.SummariserFunc(func(ctx context.Context, turns []session.Turn) (string, error) {
+			var b strings.Builder
+			for _, t := range turns {
+				b.WriteString(t.Role)
+				b.WriteString(": ")
+				b.WriteString(t.Content)
+				b.WriteString("\n")
+			}
+			resp, err := model.Complete(ctx, llm.Request{
+				System: "Сожми разговор в краткое содержание на русском, сохранив ключевые факты, имена, числа и контекст. Пиши одно-два предложения на каждое обсуждённое сообщение.",
+				Prompt: b.String(),
+			})
+			if err != nil {
+				return "", err
+			}
+			return "Краткое содержание предыдущих сообщений:\n" + resp, nil
+		})
+		dmStore, err = session.New(session.Options{
+			Dir:        sessionDir,
+			GitSync:    true,
+			Summariser: summariser,
+			Logger:     log,
+		})
+		if err != nil {
+			return fmt.Errorf("load sessions: %w", err)
+		}
+	}
+
 	handler := reply.New(reply.Options{
-		Sender:          bot,
-		Model:           model,
-		Quota:           rations,
-		Cache:           cache,
-		Alerts:          alerts,
-		Images:          images,
-		Files:           tgfile.New(bot, nil),
-		Memory:          memory.New(memory.Options{TTL: cfg.MemoryTTL}),
-		Access:          allow,
-		Commands:        admin.New(allow).WithPardoner(rations),
-		Logger:          log,
-		BotID:           me.ID,
-		BotUsername:     me.Username,
-		StorageChatID:   cfg.ImageStorageChatID,
-		MaxConcurrent:   cfg.MaxConcurrent,
-		MaxReplyRunes:   cfg.MaxReplyRunes,
-		CommandReplyTTL: cfg.CommandReplyTTL,
-		RawSystemPrompt: cfg.RawSystemPrompt,
-		PublicMaxTokens: live.PublicMaxTokens,
-		PublicMaxRunes:  live.PublicMaxRunes,
-		MaxQueue:        cfg.MaxQueue,
-		Timeout:         cfg.Timeout,
-		ImageTimeout:    cfg.ImageTimeout,
+		Sender:            bot,
+		Model:             completer,
+		Quota:             rations,
+		Cache:             cache,
+		Alerts:            alerts,
+		Images:            images,
+		Files:             tgfile.New(bot, nil),
+		Voice:             transcribe.New(cfg.GroqAPIKey, "whisper-large-v3"),
+		Memory:            memory.New(memory.Options{TTL: cfg.MemoryTTL}),
+		DMRecall:          dmStore,
+		Sessions:          dmStore,
+		Access:            allow,
+		Commands:          admin.New(allow).WithPardoner(rations),
+		Logger:            log,
+		BotID:             me.ID,
+		BotUsername:       me.Username,
+		StorageChatID:     cfg.ImageStorageChatID,
+		MaxConcurrent:     cfg.MaxConcurrent,
+		MaxReplyRunes:     cfg.MaxReplyRunes,
+		CommandReplyTTL:   cfg.CommandReplyTTL,
+		RawSystemPrompt:   cfg.RawSystemPrompt,
+		DivkaSystemPrompt: config.DivkaSystemPrompt,
+		Presets:           tuner,
+		PublicMaxTokens:   live.PublicMaxTokens,
+		PublicMaxRunes:    live.PublicMaxRunes,
+		MaxQueue:          cfg.MaxQueue,
+		Timeout:           cfg.Timeout,
+		ImageTimeout:      cfg.ImageTimeout,
 	})
 	handler.SetRawFlagEnabled(live.RawFlagEnabled)
 
@@ -214,6 +299,8 @@ func run() error {
 		Access:   allow,
 		Settings: tuner,
 		Prober:   model,
+		Picker:   model,
+		Switcher: model,
 		// One place decides what a changed setting means, so the panel does not
 		// have to know which component enforces which knob.
 		Apply: func(v settings.Values) {
@@ -227,6 +314,7 @@ func run() error {
 		BotUsername: me.Username,
 		ImagesOn:    cfg.ImagesEnabled(),
 		StartedAt:   time.Now(),
+		Restorer:    dmStore,
 	})
 
 	// guest_message is how the bot is summoned in other chats; message and
@@ -279,6 +367,10 @@ func run() error {
 		"keys", len(cfg.APIKeys),
 		"guest_mode", me.SupportsGuestQueries,
 		"images", cfg.ImagesEnabled(),
+		"web_search", cfg.SearchEnabled,
+		"tg_channel_read", cfg.TGChannelEnabled,
+		"tools", cfg.SearchEnabled || cfg.TGChannelEnabled,
+		"voice", cfg.GroqAPIKey != "",
 		"admins", len(cfg.AdminUsers),
 		"allowed_entries", len(allow.List()),
 		"state_file", cfg.StateFile,
@@ -299,4 +391,12 @@ func adminIDs(set map[int64]struct{}) []int64 {
 	}
 	slices.Sort(out) // a stable order keeps the logs readable
 	return out
+}
+
+// searchBackend reports which search path is active, for the startup log.
+func searchBackend(cfg *config.Config) string {
+	if cfg.PaxsenixKey != "" {
+		return "paxsenix"
+	}
+	return "searxng"
 }

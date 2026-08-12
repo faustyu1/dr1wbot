@@ -319,7 +319,7 @@ func TestEveryScreenRenders(t *testing.T) {
 
 	for _, name := range []string{screenMain, screenLimits, screenStats, screenPeople, screenSettings, screenHelp} {
 		t.Run(name, func(t *testing.T) {
-			text, keyboard := h.screen(name)
+			text, keyboard := h.screen(name, adminID)
 			if text == "" {
 				t.Error("screen rendered nothing")
 			}
