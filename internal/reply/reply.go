@@ -1371,7 +1371,7 @@ func (h *Handler) handleReset(ctx context.Context, chatID, userID int64) error {
 	}
 	link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, hash)
 	text := fmt.Sprintf(
-		"Контекст сброшен.\n\nСтарый диалог: <a href=\"%s\">продолжить</a>",
+		"Контекст сброшен.\n\n<a href=\"%s\">продолжить старый</a>",
 		link)
 	return h.sendPlain(ctx, chatID, text)
 }

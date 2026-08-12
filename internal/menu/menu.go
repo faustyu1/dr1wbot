@@ -410,7 +410,7 @@ func (h *Handler) HandleCallback(ctx context.Context, query telego.CallbackQuery
 		}
 		link := fmt.Sprintf("https://t.me/%s?start=restore_%s", h.botUsername, hash)
 		text := fmt.Sprintf(
-			"Контекст сброшен.\n\nСтарый диалог: <a href=\"%s\">продолжить</a>",
+			"Контекст сброшен.\n\n<a href=\"%s\">продолжить старый</a>",
 			link)
 		_, _ = h.sender.SendMessage(ctx, &telego.SendMessageParams{
 			ChatID:             telego.ChatID{ID: chatID},
