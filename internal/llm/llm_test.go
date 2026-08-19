@@ -84,8 +84,15 @@ func TestCompleteSendsAnOpenAICompatibleRequest(t *testing.T) {
 	if len(gotBody.Messages) != 2 {
 		t.Fatalf("messages = %+v, want a system and a user message", gotBody.Messages)
 	}
-	if gotBody.Messages[0].Role != "system" || gotBody.Messages[0].Content != "будь краток" {
-		t.Errorf("first message = %+v, want the system prompt", gotBody.Messages[0])
+	// The grounding note is appended to whatever prompt is configured: a model
+	// that does not know today's date answers about "now" with the year it was
+	// trained in.
+	system, _ := gotBody.Messages[0].Content.(string)
+	if gotBody.Messages[0].Role != "system" || !strings.HasPrefix(system, "будь краток") {
+		t.Errorf("first message = %+v, want the system prompt first", gotBody.Messages[0])
+	}
+	if !strings.Contains(system, "Сегодня") {
+		t.Errorf("system = %q, want today's date appended", system)
 	}
 	if gotBody.Messages[1].Role != "user" || gotBody.Messages[1].Content != "вопрос" {
 		t.Errorf("second message = %+v, want the user prompt", gotBody.Messages[1])
@@ -106,7 +113,8 @@ func TestCompleteHonoursAPerRequestSystemPrompt(t *testing.T) {
 	if len(body.Messages) != 2 {
 		t.Fatalf("messages = %+v, want a system and a user message", body.Messages)
 	}
-	if body.Messages[0].Content != "без правил" {
+	system, _ := body.Messages[0].Content.(string)
+	if !strings.HasPrefix(system, "без правил") {
 		t.Errorf("system = %v, want the per-request override, not the configured prompt", body.Messages[0].Content)
 	}
 }
@@ -129,9 +137,13 @@ func TestCompleteOmitsAnEmptySystemMessage(t *testing.T) {
 	if _, err := client.Complete(context.Background(), Request{Prompt: "вопрос"}); err != nil {
 		t.Fatalf("Complete() error = %v", err)
 	}
-	// An empty string is not a system prompt; sending one just wastes a message.
-	if len(body.Messages) != 1 || body.Messages[0].Role != "user" {
-		t.Errorf("messages = %+v, want only the user message", body.Messages)
+	// An empty prompt leaves only the grounding note, which every request
+	// carries: it is what keeps "какой сейчас год" from being answered wrong.
+	if len(body.Messages) != 2 || body.Messages[0].Role != "system" || body.Messages[1].Role != "user" {
+		t.Fatalf("messages = %+v, want the grounding note and the user message", body.Messages)
+	}
+	if system, _ := body.Messages[0].Content.(string); !strings.HasPrefix(system, "Сегодня") {
+		t.Errorf("system = %q, want nothing but the grounding note", system)
 	}
 }
 
@@ -457,5 +469,317 @@ func TestCompleteTruncatesLongErrorBodies(t *testing.T) {
 	}
 	if len(err.Error()) > errBodyLimit+128 {
 		t.Errorf("error is %d bytes, want the body snippet capped near %d", len(err.Error()), errBodyLimit)
+	}
+}
+
+// fakeSearcher stands in for DuckDuckGo.
+type fakeSearcher struct {
+	queries []string
+	answer  string
+	err     error
+}
+
+func (f *fakeSearcher) Lookup(_ context.Context, query string) (string, error) {
+	f.queries = append(f.queries, query)
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.answer, nil
+}
+
+// writeChunks sends a server-sent event stream, one chunk per line.
+func writeChunks(t *testing.T, w http.ResponseWriter, chunks ...string) {
+	t.Helper()
+	w.Header().Set("Content-Type", "text/event-stream")
+	for _, chunk := range chunks {
+		if _, err := io.WriteString(w, "data: "+chunk+"\n\n"); err != nil {
+			t.Fatalf("write chunk: %v", err)
+		}
+	}
+	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		t.Fatalf("write done: %v", err)
+	}
+}
+
+func TestStreamReportsTheAnswerAsItGrows(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeChunks(t,
+			w,
+			`{"choices":[{"delta":{"content":"Пер"}}]}`,
+			`{"choices":[{"delta":{"content":"вое "}}]}`,
+			`{"choices":[{"delta":{"content":"слово"},"finish_reason":"stop"}]}`,
+		)
+	})
+
+	var seen []string
+	answer, err := client.Stream(context.Background(), Request{Prompt: "вопрос"}, func(e Event) {
+		seen = append(seen, e.Text)
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if answer != "Первое слово" {
+		t.Errorf("Stream() = %q, want the assembled answer", answer)
+	}
+	// Every event carries the whole answer so far, because that is what an edit
+	// to a Telegram message needs.
+	want := []string{"Пер", "Первое ", "Первое слово"}
+	if len(seen) != len(want) {
+		t.Fatalf("events = %q, want %q", seen, want)
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Errorf("event %d = %q, want %q", i, seen[i], want[i])
+		}
+	}
+}
+
+func TestStreamAsksForAStream(t *testing.T) {
+	var body completionRequest
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		writeChunks(t, w, `{"choices":[{"delta":{"content":"ок"},"finish_reason":"stop"}]}`)
+	})
+
+	if _, err := client.Stream(context.Background(), Request{Prompt: "вопрос"}, func(Event) {}); err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if !body.Stream {
+		t.Error("stream = false, want a streamed request")
+	}
+}
+
+func TestCompleteOffersTheSearchToolWhenOneIsConfigured(t *testing.T) {
+	var body completionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		writeAnswer(t, w, "ок")
+	}))
+	t.Cleanup(server.Close)
+
+	client := New(Options{
+		BaseURL: server.URL,
+		APIKeys: []string{"sk-test"},
+		Models:  []string{"test-model"},
+		Timeout: time.Second,
+		Search:  &fakeSearcher{},
+	})
+	if _, err := client.Complete(context.Background(), Request{Prompt: "что нового"}); err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if len(body.Tools) != 1 || body.Tools[0].Function.Name != searchToolName {
+		t.Fatalf("tools = %+v, want the search tool offered", body.Tools)
+	}
+	if body.ToolChoice != "auto" {
+		t.Errorf("tool_choice = %q, want auto: the model decides when to look something up", body.ToolChoice)
+	}
+}
+
+func TestCompleteRunsASearchAndAnswersFromIt(t *testing.T) {
+	search := &fakeSearcher{answer: "1. Вышла Go 1.26\nhttps://go.dev"}
+	var bodies []completionRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body completionRequest
+		_ = json.Unmarshal(raw, &body)
+		bodies = append(bodies, body)
+
+		if len(bodies) == 1 {
+			// The model asks to look something up before answering.
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function",`+
+				`"function":{"name":"web_search","arguments":"{\"query\":\"последняя версия go\"}"}}]},`+
+				`"finish_reason":"tool_calls"}]}`)
+			return
+		}
+		writeAnswer(t, w, "Последняя — Go 1.26.")
+	}))
+	t.Cleanup(server.Close)
+
+	client := New(Options{
+		BaseURL: server.URL,
+		APIKeys: []string{"sk-test"},
+		Models:  []string{"test-model"},
+		Timeout: time.Second,
+		Search:  search,
+	})
+
+	answer, err := client.Complete(context.Background(), Request{Prompt: "какая последняя версия go"})
+	if err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if answer != "Последняя — Go 1.26." {
+		t.Errorf("Complete() = %q, want the answer written after the search", answer)
+	}
+	if len(search.queries) != 1 || search.queries[0] != "последняя версия go" {
+		t.Fatalf("queries = %q, want the model's own query", search.queries)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("calls = %d, want the search round and the answer round", len(bodies))
+	}
+
+	// The second round carries the tool call and its result, or the model has
+	// no idea what it just looked up.
+	last := bodies[1].Messages[len(bodies[1].Messages)-1]
+	if last.Role != "tool" || last.ToolCallID != "call_1" {
+		t.Fatalf("last message = %+v, want the tool result", last)
+	}
+	if content, _ := last.Content.(string); !strings.Contains(content, "Go 1.26") {
+		t.Errorf("tool content = %v, want the search results", last.Content)
+	}
+	// One question, one answer: a tool round is not an answer.
+	if got := client.Stats(); got.Searches != 1 || got.Requests != 1 {
+		t.Errorf("stats = %+v, want one request and one search", got)
+	}
+}
+
+func TestStreamReassemblesASplitToolCall(t *testing.T) {
+	search := &fakeSearcher{answer: "нашлось"}
+	round := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		round++
+		if round == 1 {
+			// Arguments arrive split across chunks, keyed by index.
+			writeChunks(t, w,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","type":"function","function":{"name":"web_search","arguments":"{\"que"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ry\":\"погода\"}"}}]},"finish_reason":"tool_calls"}]}`,
+			)
+			return
+		}
+		writeChunks(t, w, `{"choices":[{"delta":{"content":"Дождь."},"finish_reason":"stop"}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	client := New(Options{
+		BaseURL: server.URL,
+		APIKeys: []string{"sk-test"},
+		Models:  []string{"test-model"},
+		Timeout: time.Second,
+		Search:  search,
+	})
+
+	var searching []string
+	answer, err := client.Stream(context.Background(), Request{Prompt: "погода"}, func(e Event) {
+		if e.Searching != "" {
+			searching = append(searching, e.Searching)
+		}
+	})
+	if err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if answer != "Дождь." {
+		t.Errorf("Stream() = %q, want the answer after the lookup", answer)
+	}
+	if len(search.queries) != 1 || search.queries[0] != "погода" {
+		t.Errorf("queries = %q, want the split arguments reassembled", search.queries)
+	}
+	// The caller is told a lookup is happening, so the chat does not sit on a
+	// half-sentence that is about to be thrown away.
+	if len(searching) != 1 || searching[0] != "погода" {
+		t.Errorf("searching events = %q, want the query announced", searching)
+	}
+}
+
+func TestSearchCanBeSwitchedOff(t *testing.T) {
+	var body completionRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		writeAnswer(t, w, "ок")
+	}))
+	t.Cleanup(server.Close)
+
+	client := New(Options{
+		BaseURL: server.URL,
+		APIKeys: []string{"sk-test"},
+		Models:  []string{"test-model"},
+		Timeout: time.Second,
+		Search:  &fakeSearcher{},
+	})
+	client.SetSearchEnabled(false)
+
+	if _, err := client.Complete(context.Background(), Request{Prompt: "вопрос"}); err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if len(body.Tools) != 0 {
+		t.Errorf("tools = %+v, want none once search is off", body.Tools)
+	}
+	if client.SearchAvailable() {
+		t.Error("SearchAvailable() = true after switching search off")
+	}
+}
+
+func TestAFailedSearchStillProducesAnAnswer(t *testing.T) {
+	search := &fakeSearcher{err: errors.New("captcha")}
+	round := 0
+	var second completionRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		round++
+		if round == 1 {
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"tool_calls":[{"id":"c1","type":"function",`+
+				`"function":{"name":"web_search","arguments":"{\"query\":\"x\"}"}}]},"finish_reason":"tool_calls"}]}`)
+			return
+		}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &second)
+		writeAnswer(t, w, "По памяти:")
+	}))
+	t.Cleanup(server.Close)
+
+	client := New(Options{
+		BaseURL: server.URL,
+		APIKeys: []string{"sk-test"},
+		Models:  []string{"test-model"},
+		Timeout: time.Second,
+		Search:  search,
+	})
+
+	answer, err := client.Complete(context.Background(), Request{Prompt: "вопрос"})
+	if err != nil {
+		t.Fatalf("Complete() error = %v, want a failed lookup to be survivable", err)
+	}
+	if answer != "По памяти:" {
+		t.Errorf("Complete() = %q, want the model to answer anyway", answer)
+	}
+	last := second.Messages[len(second.Messages)-1]
+	if content, _ := last.Content.(string); !strings.Contains(content, "captcha") {
+		t.Errorf("tool content = %v, want the failure explained to the model", last.Content)
+	}
+}
+
+func TestToolRoundsAreBounded(t *testing.T) {
+	search := &fakeSearcher{answer: "ещё результаты"}
+	rounds := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		rounds++
+		if rounds > maxToolRounds {
+			writeAnswer(t, w, "хватит")
+			return
+		}
+		// A model that only ever wants to search again would loop forever, and
+		// every turn of that loop is billed.
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"tool_calls":[{"id":"c","type":"function",`+
+			`"function":{"name":"web_search","arguments":"{\"query\":\"ещё\"}"}}]},"finish_reason":"tool_calls"}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	client := New(Options{
+		BaseURL: server.URL,
+		APIKeys: []string{"sk-test"},
+		Models:  []string{"test-model"},
+		Timeout: 2 * time.Second,
+		Search:  search,
+	})
+
+	if _, err := client.Complete(context.Background(), Request{Prompt: "вопрос"}); err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if rounds != maxToolRounds+1 {
+		t.Errorf("rounds = %d, want the loop cut off after %d searches", rounds, maxToolRounds)
 	}
 }

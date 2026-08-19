@@ -263,7 +263,11 @@ func TestWarnsExpire(t *testing.T) {
 	s.Judge(111)
 	s.Judge(111) // warn 1 again, not warn 2
 
-	if s.Callers(10)[0].Forever {
+	ban, blocked := s.Blocked(111, "")
+	if !blocked {
+		t.Fatal("Blocked() = false, want the second violation to still cost a timeout")
+	}
+	if ban.Forever {
 		t.Error("caller was banned forever on a warn that should have expired")
 	}
 }
@@ -450,7 +454,7 @@ func TestAFreshAccountStillGetsSomething(t *testing.T) {
 	}
 }
 
-func TestManualBanAndCallers(t *testing.T) {
+func TestAManualBanRefusesTheNextRequest(t *testing.T) {
 	c := &clock{at: time.Now()}
 	s, err := New(Options{Limit: 10, Burst: 100, Window: time.Minute, BanFor: time.Hour, Now: c.now})
 	if err != nil {
@@ -461,20 +465,15 @@ func TestManualBanAndCallers(t *testing.T) {
 	s.Judge(222)
 	s.Ban(222, 0)
 
-	callers := s.Callers(10)
-	if len(callers) != 2 {
-		t.Fatalf("Callers() = %+v, want both", callers)
-	}
-	// Banned first: those are the ones an admin came to review.
-	if callers[0].ID != 222 || !callers[0].Banned() {
-		t.Errorf("Callers()[0] = %+v, want the banned one first", callers[0])
-	}
 	if v, _, _ := s.Judge(222); v != Banned {
 		t.Errorf("Judge() = %v after a manual ban, want Banned", v)
 	}
+	if v, _, _ := s.Judge(111); v != Granted {
+		t.Errorf("Judge() = %v for a bystander, want Granted", v)
+	}
 }
 
-func TestCallersIsCapped(t *testing.T) {
+func TestBansIsCapped(t *testing.T) {
 	c := &clock{at: time.Now()}
 	s, err := New(Options{Limit: 10, Burst: 100, Window: time.Minute, Now: c.now})
 	if err != nil {
@@ -482,11 +481,179 @@ func TestCallersIsCapped(t *testing.T) {
 	}
 
 	for id := int64(1); id <= 20; id++ {
-		s.Judge(id)
+		s.Ban(id, 0)
 	}
 	// Telegram caps a keyboard's size, and a panel with sixty buttons is not a
 	// panel.
-	if got := len(s.Callers(8)); got != 8 {
-		t.Errorf("Callers(8) returned %d", got)
+	if got := len(s.Bans(8)); got != 8 {
+		t.Errorf("Bans(8) returned %d", got)
+	}
+}
+
+func TestBanByHandWithoutATimeIsForever(t *testing.T) {
+	c := &clock{at: time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)}
+	s := newStore(t, 100, "", c)
+
+	s.Ban(111, 0)
+
+	if _, blocked := s.Blocked(111, ""); !blocked {
+		t.Fatal("Blocked() = false right after a ban")
+	}
+	c.at = c.at.Add(365 * 24 * time.Hour)
+	if _, blocked := s.Blocked(111, ""); !blocked {
+		t.Error("Blocked() = false a year later, want a ban with no end to have none")
+	}
+}
+
+func TestBanByHandForATimeExpires(t *testing.T) {
+	c := &clock{at: time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)}
+	s := newStore(t, 100, "", c)
+
+	s.Ban(111, time.Hour)
+
+	if _, blocked := s.Blocked(111, ""); !blocked {
+		t.Fatal("Blocked() = false right after a timed ban")
+	}
+	c.at = c.at.Add(2 * time.Hour)
+	if _, blocked := s.Blocked(111, ""); blocked {
+		t.Error("Blocked() = true after the ban ran out")
+	}
+}
+
+func TestBanAppliesToWhoeverIsWhitelisted(t *testing.T) {
+	c := &clock{at: time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)}
+	// A closed bot still records bans: they are about behaviour, not about the
+	// public allowance.
+	s := newStore(t, 0, "", c)
+
+	s.Ban(111, 0)
+	if _, blocked := s.Blocked(111, ""); !blocked {
+		t.Error("Blocked() = false with the public allowance off, want the ban to stand anyway")
+	}
+}
+
+func TestBanByNameCatchesTheUserWhenTheyAppear(t *testing.T) {
+	c := &clock{at: time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)}
+	s := newStore(t, 100, "", c)
+
+	if id, known := s.BanName("@Spammer", 0); known || id != 0 {
+		t.Fatalf("BanName() = (%d, %v), want an unknown name", id, known)
+	}
+	if _, blocked := s.Blocked(111, "spammer"); !blocked {
+		t.Error("Blocked() = false for a banned name")
+	}
+
+	if pinned := s.Note(111, "SpAmMeR"); !pinned {
+		t.Error("Note() = false, want the ban pinned to the id on first sight")
+	}
+	// Pinned to the id, so a rename does not shake it off.
+	if _, blocked := s.Blocked(111, "renamed"); !blocked {
+		t.Error("Blocked() = false after a rename, want the ban to follow the id")
+	}
+	if got, known := s.Lookup("spammer"); !known || got != 111 {
+		t.Errorf("Lookup() = (%d, %v), want the id the name resolved to", got, known)
+	}
+}
+
+func TestBanByNameResolvesAKnownUser(t *testing.T) {
+	c := &clock{at: time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)}
+	s := newStore(t, 100, "", c)
+
+	s.Judge(111) // gives the caller a record
+	s.Note(111, "spammer")
+
+	id, known := s.BanName("spammer", time.Hour)
+	if !known || id != 111 {
+		t.Fatalf("BanName() = (%d, %v), want the known id", id, known)
+	}
+	if v, _, _ := s.Judge(111); v != Banned {
+		t.Errorf("Judge() = %v, want Banned", v)
+	}
+}
+
+func TestPardonNameLiftsBothHalves(t *testing.T) {
+	c := &clock{at: time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)}
+	s := newStore(t, 100, "", c)
+
+	s.BanName("spammer", 0)
+	s.Note(111, "spammer")
+
+	if !s.PardonName("@spammer") {
+		t.Fatal("PardonName() = false, want the ban lifted")
+	}
+	if _, blocked := s.Blocked(111, "spammer"); blocked {
+		t.Error("Blocked() = true after the name was pardoned")
+	}
+	if s.PardonName("spammer") {
+		t.Error("PardonName() = true the second time, want nothing left to lift")
+	}
+}
+
+func TestPardonAlsoLiftsTheNameBan(t *testing.T) {
+	c := &clock{at: time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)}
+	s := newStore(t, 100, "", c)
+
+	s.BanName("spammer", 0)
+	s.Note(111, "spammer")
+	s.Pardon(111)
+
+	// Leaving the name banned would re-ban them on their very next message.
+	if _, blocked := s.Blocked(111, "spammer"); blocked {
+		t.Error("Blocked() = true after a pardon, want the name ban lifted too")
+	}
+}
+
+func TestBansListsBothKinds(t *testing.T) {
+	c := &clock{at: time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)}
+	s, err := New(Options{Limit: 100, Burst: 1, Window: time.Minute, BanFor: time.Hour, Now: c.now})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	s.Judge(222)
+	s.Judge(222) // earns an automatic ban
+	s.Ban(111, 0)
+	s.BanName("ghost", 0)
+
+	list := s.Bans(10)
+	if len(list) != 3 {
+		t.Fatalf("Bans() = %+v, want three", list)
+	}
+	// Hand-placed decisions come first; the flood detector's own bans are
+	// routine and expire on their own.
+	if !list[0].Manual || !list[1].Manual {
+		t.Errorf("Bans() = %+v, want manual bans first", list)
+	}
+	if last := list[2]; last.ID != 222 || last.Manual {
+		t.Errorf("Bans() last = %+v, want the automatic ban", last)
+	}
+}
+
+func TestManualBansSurviveARestart(t *testing.T) {
+	c := &clock{at: time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)}
+	file := filepath.Join(t.TempDir(), "quota.json")
+
+	first := newStore(t, 100, file, c)
+	first.Ban(111, 0)
+	first.BanName("ghost", 24*time.Hour)
+
+	second := newStore(t, 100, file, c)
+	if _, blocked := second.Blocked(111, ""); !blocked {
+		t.Error("Blocked() = false after a restart, want the ban to persist")
+	}
+	if _, blocked := second.Blocked(999, "ghost"); !blocked {
+		t.Error("Blocked() = false after a restart, want the name ban to persist")
+	}
+}
+
+func TestNoteIgnoresStrangersWithNothingToRemember(t *testing.T) {
+	c := &clock{at: time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)}
+	s := newStore(t, 100, "", c)
+
+	// Every message goes through Note; a whitelisted regular must not grow a
+	// record per message.
+	s.Note(111, "regular")
+	if len(s.users) != 0 {
+		t.Errorf("users = %+v, want nothing recorded for a caller with no history and no ban", s.users)
 	}
 }
