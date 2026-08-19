@@ -258,6 +258,12 @@ type toolCall struct {
 	ID       string       `json:"id"`
 	Type     string       `json:"type"`
 	Function functionCall `json:"function"`
+	// ExtraContent is whatever the backend hangs off the call outside the
+	// OpenAI schema. Gemini's thinking models put a signed record of the
+	// reasoning that led to the call there and reject the next round with a
+	// 400 if it does not come back untouched, so it is carried through
+	// verbatim rather than parsed.
+	ExtraContent json.RawMessage `json:"extra_content,omitempty"`
 }
 
 type functionCall struct {
@@ -370,10 +376,11 @@ type streamChunk struct {
 		Delta struct {
 			Content   string `json:"content"`
 			ToolCalls []struct {
-				Index    int          `json:"index"`
-				ID       string       `json:"id"`
-				Type     string       `json:"type"`
-				Function functionCall `json:"function"`
+				Index        int             `json:"index"`
+				ID           string          `json:"id"`
+				Type         string          `json:"type"`
+				Function     functionCall    `json:"function"`
+				ExtraContent json.RawMessage `json:"extra_content"`
 			} `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
@@ -790,6 +797,9 @@ func readStream(body io.Reader, sink Sink) (reply, error) {
 			}
 			if delta.Function.Name != "" {
 				call.Function.Name = delta.Function.Name
+			}
+			if len(delta.ExtraContent) > 0 {
+				call.ExtraContent = delta.ExtraContent
 			}
 			call.Function.Arguments += delta.Function.Arguments
 		}

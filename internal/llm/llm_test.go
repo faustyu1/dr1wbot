@@ -683,6 +683,106 @@ func TestStreamReassemblesASplitToolCall(t *testing.T) {
 	}
 }
 
+// Gemini's thinking models sign every function call and reject the next round
+// if the signature does not come back with it. The field is not part of the
+// OpenAI schema, so it is carried through verbatim rather than understood.
+func TestCompleteSendsTheThoughtSignatureBack(t *testing.T) {
+	const signature = `{"google":{"thought_signature":"CvcQAdHN2OekY10ClPFkYA=="}}`
+	search := &fakeSearcher{answer: "нашлось"}
+	var bodies []completionRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body completionRequest
+		_ = json.Unmarshal(raw, &body)
+		bodies = append(bodies, body)
+
+		if len(bodies) == 1 {
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"tool_calls":[{"id":"call_1","type":"function",`+
+				`"extra_content":`+signature+`,`+
+				`"function":{"name":"web_search","arguments":"{\"query\":\"погода\"}"}}]},`+
+				`"finish_reason":"tool_calls"}]}`)
+			return
+		}
+		writeAnswer(t, w, "Дождь.")
+	}))
+	t.Cleanup(server.Close)
+
+	client := New(Options{
+		BaseURL: server.URL,
+		APIKeys: []string{"sk-test"},
+		Models:  []string{"test-model"},
+		Timeout: time.Second,
+		Search:  search,
+	})
+
+	if _, err := client.Complete(context.Background(), Request{Prompt: "погода"}); err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("calls = %d, want the search round and the answer round", len(bodies))
+	}
+	if got := signatureOf(t, bodies[1]); got != signature {
+		t.Errorf("extra_content = %s, want %s", got, signature)
+	}
+}
+
+func TestStreamSendsTheThoughtSignatureBack(t *testing.T) {
+	const signature = `{"google":{"thought_signature":"Cs4BAdHtim9k"}}`
+	search := &fakeSearcher{answer: "нашлось"}
+	var bodies []completionRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body completionRequest
+		_ = json.Unmarshal(raw, &body)
+		bodies = append(bodies, body)
+
+		if len(bodies) == 1 {
+			// The signature rides along with one of the argument chunks.
+			writeChunks(t, w,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","type":"function","function":{"name":"web_search","arguments":"{\"que"}}]}}]}`,
+				`{"choices":[{"delta":{"tool_calls":[{"index":0,"extra_content":`+signature+`,"function":{"arguments":"ry\":\"погода\"}"}}]},"finish_reason":"tool_calls"}]}`,
+			)
+			return
+		}
+		writeChunks(t, w, `{"choices":[{"delta":{"content":"Дождь."},"finish_reason":"stop"}]}`)
+	}))
+	t.Cleanup(server.Close)
+
+	client := New(Options{
+		BaseURL: server.URL,
+		APIKeys: []string{"sk-test"},
+		Models:  []string{"test-model"},
+		Timeout: time.Second,
+		Search:  search,
+	})
+
+	if _, err := client.Stream(context.Background(), Request{Prompt: "погода"}, func(Event) {}); err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("calls = %d, want the search round and the answer round", len(bodies))
+	}
+	if got := signatureOf(t, bodies[1]); got != signature {
+		t.Errorf("extra_content = %s, want %s", got, signature)
+	}
+}
+
+// signatureOf digs the tool call's extra_content out of the assistant message
+// of a follow-up round.
+func signatureOf(t *testing.T, body completionRequest) string {
+	t.Helper()
+	for _, msg := range body.Messages {
+		if msg.Role != "assistant" || len(msg.ToolCalls) == 0 {
+			continue
+		}
+		return string(msg.ToolCalls[0].ExtraContent)
+	}
+	t.Fatalf("no assistant tool call in %+v", body.Messages)
+	return ""
+}
+
 func TestSearchCanBeSwitchedOff(t *testing.T) {
 	var body completionRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
