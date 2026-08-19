@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mymmrac/telego"
@@ -42,6 +43,12 @@ type Sender interface {
 	// SendMessage serves the private chat, which is not guest mode: there is
 	// no query to answer once, so a reply is simply sent.
 	SendMessage(ctx context.Context, params *telego.SendMessageParams) (*telego.Message, error)
+	// SendRichMessage posts a finished answer into a private chat in the rich
+	// dialect, which is what a draft has to be persisted as.
+	SendRichMessage(ctx context.Context, params *telego.SendRichMessageParams) (*telego.Message, error)
+	// SendRichMessageDraft streams a partial answer into a private chat.
+	// Telegram animates the draft itself, so nothing here edits a message.
+	SendRichMessageDraft(ctx context.Context, params *telego.SendRichMessageDraftParams) error
 }
 
 // Gatekeeper decides who may summon the bot and who runs it.
@@ -150,9 +157,13 @@ const captionLimit = 1024
 // several times a second is harder to read than one that arrives in steps.
 const defaultStreamEvery = 1500 * time.Millisecond
 
-// streamCursor marks the end of a partial answer, so a message that stops
-// mid-sentence reads as "still writing" rather than as "this is the answer".
-const streamCursor = " ▍"
+// draftRefresh is how often an unchanged draft is sent again. A draft is a
+// 30-second preview: one that is not renewed vanishes mid-answer, and a model
+// that is still thinking has nothing new to show meanwhile.
+const draftRefresh = 15 * time.Second
+
+// msgThinking is what the draft says before the first words arrive.
+const msgThinking = "Думаю над ответом"
 
 // msgSearching is what the chat shows while the model looks something up. The
 // query is included because it is the interesting part: it says what the bot
@@ -493,16 +504,15 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 	}
 	defer done()
 
-	// The same placeholder the guest path shows, for the same reason: an answer
-	// takes seconds, and silence for seconds reads as a broken bot.
-	messageID, err := h.sendPlaceholder(ctx, msg.Chat.ID)
-	if err != nil {
-		return err
-	}
+	// A private chat gets Telegram's own streaming: a draft that says "thinking"
+	// until the words start, then grows into the answer. It is a preview and is
+	// never persisted, so the finished answer is sent as its own message.
+	d := h.startDraft(ctx, msg.Chat.ID)
 
 	release, ok := h.acquire(ctx)
 	if !ok {
-		return h.editChatText(ctx, msg.Chat.ID, messageID, msgBusy)
+		d.end()
+		return h.sendPlain(ctx, msg.Chat.ID, msgBusy)
 	}
 	defer release()
 
@@ -517,14 +527,17 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 	// A private chat is a real conversation, so every message continues it —
 	// there is no reply-to signal to wait for the way guest mode needs one.
 	started := time.Now()
-	answer, err := h.think(llmCtx, log, llm.Request{
+	answer, err := h.think(llmCtx, llm.Request{
 		Prompt:    question,
 		History:   h.history(msg.Chat.ID, true),
 		System:    system,
 		MaxTokens: budget,
-	}, func(text string) error {
-		return h.editChatPlain(ctx, msg.Chat.ID, messageID, text)
-	})
+	}, d)
+
+	// Ending the draft before anything is sent is what keeps a stale fragment
+	// from landing on top of the finished answer.
+	d.end()
+
 	if err != nil {
 		log.Error("llm call failed", "err", err, "took", time.Since(started))
 		text := msgFailed
@@ -537,7 +550,7 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 		case errors.Is(err, context.DeadlineExceeded):
 			text = msgTimeout
 		}
-		return h.editChatText(ctx, msg.Chat.ID, messageID, text)
+		return h.sendPlain(ctx, msg.Chat.ID, text)
 	}
 	log.Info("answered", "took", time.Since(started), "runes", len([]rune(answer)), "raw", raw)
 
@@ -545,60 +558,29 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 		h.recall.Remember(msg.Chat.ID, question, answer)
 	}
 
-	return h.editChatText(ctx, msg.Chat.ID, messageID, mdtext.Truncate(answer, h.maxReplyRunes))
+	return h.sendRich(ctx, msg.Chat.ID, mdtext.Truncate(answer, h.maxReplyRunes))
 }
 
-// sendPlaceholder posts the "working on it" marker and returns its id, so the
-// answer can replace it in place.
-func (h *Handler) sendPlaceholder(ctx context.Context, chatID int64) (int, error) {
-	sent, err := h.sender.SendMessage(ctx, &telego.SendMessageParams{
-		ChatID:    telego.ChatID{ID: chatID},
-		Text:      tgemoji.Placeholder(),
-		ParseMode: telego.ModeHTML,
-	})
-	if err == nil {
-		return sent.MessageID, nil
-	}
-
-	// A bot that may not send custom emoji still needs a placeholder.
-	h.log.Warn("custom placeholder rejected, falling back to a plain one", "err", err)
-	sent, plainErr := h.sender.SendMessage(ctx, &telego.SendMessageParams{
-		ChatID: telego.ChatID{ID: chatID},
-		Text:   tgemoji.PlaceholderPlain(),
-	})
-	if plainErr != nil {
-		return 0, errors.Join(err, plainErr)
-	}
-	return sent.MessageID, nil
-}
-
-// editChatText replaces a private-chat message with text.
+// sendRich posts the finished answer into a private chat.
 //
 // It goes through a rich message, the same as the guest path: that dialect
 // carries headings, tables and fenced code, which is what the model actually
-// emits and what the legacy Markdown parse mode cannot render. A rejected edit
-// is retried as unformatted text, so the content always arrives.
-func (h *Handler) editChatText(parent context.Context, chatID int64, messageID int, text string) error {
+// emits and what the legacy Markdown parse mode cannot render. A rejected
+// message is retried as unformatted text, so the content always arrives.
+func (h *Handler) sendRich(parent context.Context, chatID int64, text string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), editTimeout)
 	defer cancel()
 
-	_, err := h.sender.EditMessageText(ctx, &telego.EditMessageTextParams{
+	_, err := h.sender.SendRichMessage(ctx, &telego.SendRichMessageParams{
 		ChatID:      telego.ChatID{ID: chatID},
-		MessageID:   messageID,
-		RichMessage: &telego.InputRichMessage{Markdown: text},
+		RichMessage: telego.InputRichMessage{Markdown: text},
 	})
 	if err == nil {
 		return nil
 	}
 
-	h.log.Warn("rich edit rejected in a private chat, retrying as plain text", "err", err)
-	_, plainErr := h.sender.EditMessageText(ctx, &telego.EditMessageTextParams{
-		ChatID:             telego.ChatID{ID: chatID},
-		MessageID:          messageID,
-		Text:               text,
-		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
-	})
-	if plainErr != nil {
+	h.log.Warn("rich answer rejected in a private chat, retrying as plain text", "err", err)
+	if plainErr := h.sendPlain(ctx, chatID, text); plainErr != nil {
 		return errors.Join(err, plainErr)
 	}
 	return nil
@@ -767,15 +749,13 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 	}
 
 	started := time.Now()
-	answer, err := h.think(llmCtx, log, llm.Request{
+	answer, err := h.think(llmCtx, llm.Request{
 		Prompt:    prompt,
 		Images:    attachments,
 		History:   h.history(msg.Chat.ID, followUp),
 		System:    system,
 		MaxTokens: budget,
-	}, func(text string) error {
-		return h.editPlain(ctx, inlineID, text)
-	})
+	}, nil)
 	if err != nil {
 		if errors.Is(err, llm.ErrRateLimited) {
 			h.alert(ctx, alert.KindNoKeys,
@@ -809,87 +789,163 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 	return h.editText(ctx, inlineID, mdtext.Truncate(answer, h.maxReplyRunes))
 }
 
-// live holds the newest version of a partially written answer, so the editor
-// goroutine can push it into the chat at its own pace instead of once per
-// token. Telegram rate-limits edits per message; the model does not.
-type live struct {
-	mu    sync.Mutex
-	text  string
-	dirty bool
+// draftID hands out the identifier every draft is animated under. Telegram
+// animates changes to drafts that share an identifier, so two answers in the
+// same chat must not share one.
+var draftID atomic.Int64
+
+// draft is the answer being written, shown through Telegram's own streaming:
+// sendRichMessageDraft replaces a message that we would otherwise have to post
+// and then edit over and over, and Telegram animates the growth for us.
+//
+// The text is deliberately unformatted while it grows: half of a Markdown table
+// or an unclosed code fence is not valid markup. The finished answer is a
+// separate, formatted message — the draft itself is never persisted.
+type draft struct {
+	h      *Handler
+	chatID int64
+	id     int
+
+	mu     sync.Mutex
+	status string // shown in the "thinking" block until the first words arrive
+	text   string
+	dirty  bool
+
+	stop chan struct{}
+	done chan struct{}
 }
 
-// put replaces what should be shown next.
-func (l *live) put(text string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if text == l.text {
+// startDraft puts a "thinking" draft in the chat and keeps it alive until it is
+// stopped. The first one goes out immediately: an answer takes seconds, and
+// seconds of silence read as a broken bot.
+func (h *Handler) startDraft(ctx context.Context, chatID int64) *draft {
+	d := &draft{
+		h:      h,
+		chatID: chatID,
+		id:     int(draftID.Add(1)),
+		status: msgThinking,
+		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
+	}
+	d.push(ctx)
+	go d.run(ctx)
+	return d
+}
+
+// searching says what the model went to look up. It is the interesting part of
+// a pause: it tells the reader what the bot understood the question to be about.
+func (d *draft) searching(query string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.status, d.text, d.dirty = msgSearching(query), "", true
+}
+
+// write replaces the partial answer shown next.
+func (d *draft) write(text string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if text == d.text {
 		return
 	}
-	l.text, l.dirty = text, true
+	d.text, d.dirty = text, true
 }
 
-// take returns the newest text once, or reports that nothing changed. Telegram
-// rejects an edit that would not change the message, so an unchanged answer
-// must not be sent again.
-func (l *live) take() (string, bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if !l.dirty {
-		return "", false
+// end stops the draft. It returns once nothing more will be sent, so the
+// finished answer can never be overtaken by a stale fragment of itself.
+func (d *draft) end() {
+	if d == nil {
+		return
 	}
-	l.dirty = false
-	return l.text, true
+	close(d.stop)
+	<-d.done
 }
 
-// think runs the model. When streaming is on, show is called with the answer as
-// it grows; otherwise it is never called and the answer arrives once, whole.
-//
-// The streaming text is deliberately unformatted: half of a Markdown table or
-// an unclosed code fence is not valid markup, and Telegram rejects the edit
-// rather than rendering it. The finished answer is what gets the formatting.
-func (h *Handler) think(ctx context.Context, log *slog.Logger, req llm.Request, show func(string) error) (string, error) {
-	if !h.streaming() || show == nil {
+// run pushes the draft at the handler's pace rather than once per token, and
+// renews it while the model is quiet so the preview does not expire.
+func (d *draft) run(ctx context.Context) {
+	defer close(d.done)
+
+	every := d.h.streamEvery
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+
+	sent := time.Now()
+	for {
+		select {
+		case <-d.stop:
+			return
+		case <-ticker.C:
+			if !d.take() && time.Since(sent) < draftRefresh {
+				continue
+			}
+			sent = time.Now()
+			d.push(ctx)
+		}
+	}
+}
+
+// take reports whether anything changed since the last push, clearing the flag.
+func (d *draft) take() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	changed := d.dirty
+	d.dirty = false
+	return changed
+}
+
+// push sends the current state. A rejected draft is not worth failing over: it
+// is a preview, and the finished answer is a different call.
+func (d *draft) push(parent context.Context) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), editTimeout)
+	defer cancel()
+
+	err := d.h.sender.SendRichMessageDraft(ctx, &telego.SendRichMessageDraftParams{
+		ChatID:      d.chatID,
+		DraftID:     d.id,
+		RichMessage: d.message(),
+	})
+	if err != nil {
+		d.h.log.Debug("could not show the answer as it is written", "err", err)
+	}
+}
+
+// message renders the draft: the native "thinking" block while there is nothing
+// to read yet, the words themselves once there are.
+func (d *draft) message() telego.InputRichMessage {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var block telego.InputRichBlock
+	if d.text == "" {
+		block = &telego.InputRichBlockThinking{
+			Type: telego.BlockTypeThinking,
+			Text: telego.ToPtr(telego.RichTextPlain(d.status)),
+		}
+	} else {
+		block = &telego.InputRichBlockParagraph{
+			Type: telego.BlockTypeParagraph,
+			Text: telego.ToPtr(telego.RichTextPlain(d.text)),
+		}
+	}
+	return telego.InputRichMessage{Blocks: []telego.InputRichBlock{block}}
+}
+
+// think runs the model. A draft means the answer is streamed into it as it is
+// written; without one — or with streaming switched off — the answer arrives
+// once, whole.
+func (h *Handler) think(ctx context.Context, req llm.Request, d *draft) (string, error) {
+	if d == nil || !h.streaming() {
 		return h.model.Complete(ctx, req)
 	}
 
-	l := &live{}
-	stop, done := make(chan struct{}), make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(h.streamEvery)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				text, changed := l.take()
-				if !changed {
-					continue
-				}
-				if err := show(text); err != nil {
-					// A rejected intermediate edit is not worth failing over:
-					// the finished answer is written by a different call.
-					log.Debug("could not show the answer as it is written", "err", err)
-				}
-			}
-		}
-	}()
-
-	answer, err := h.streamer.Stream(ctx, req, func(e llm.Event) {
+	return h.streamer.Stream(ctx, req, func(e llm.Event) {
 		switch {
 		case e.Searching != "":
-			l.put(msgSearching(e.Searching))
+			d.searching(e.Searching)
 		case e.Text != "":
-			l.put(mdtext.Truncate(e.Text, h.maxReplyRunes) + streamCursor)
+			d.write(mdtext.Truncate(e.Text, h.maxReplyRunes))
 		}
 	})
-
-	// Stopping before returning is what guarantees no half-written text lands
-	// after the finished answer: the caller edits the message next.
-	close(stop)
-	<-done
-	return answer, err
 }
 
 // blocked reports whether this caller is banned, and remembers the @username
@@ -1209,36 +1265,6 @@ func (h *Handler) editText(parent context.Context, inlineMessageID, text string)
 		return errors.Join(err, plainErr)
 	}
 	return nil
-}
-
-// editPlain replaces an inline message with unformatted text. It is what the
-// streaming path uses: a half-written answer is usually half-written markup
-// too, and Telegram rejects the edit rather than rendering it.
-func (h *Handler) editPlain(parent context.Context, inlineMessageID, text string) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), editTimeout)
-	defer cancel()
-
-	_, err := h.sender.EditMessageText(ctx, &telego.EditMessageTextParams{
-		InlineMessageID:    inlineMessageID,
-		Text:               text,
-		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
-	})
-	return err
-}
-
-// editChatPlain is editPlain for a private chat, which has a message id rather
-// than an inline one.
-func (h *Handler) editChatPlain(parent context.Context, chatID int64, messageID int, text string) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), editTimeout)
-	defer cancel()
-
-	_, err := h.sender.EditMessageText(ctx, &telego.EditMessageTextParams{
-		ChatID:             telego.ChatID{ID: chatID},
-		MessageID:          messageID,
-		Text:               text,
-		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
-	})
-	return err
 }
 
 // markdown wraps text as a rich message.

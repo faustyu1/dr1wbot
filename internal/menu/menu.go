@@ -336,7 +336,7 @@ var knobs = []knob{{
 	},
 	cycle: func(v *settings.Values) { v.SearchEnabled = !v.SearchEnabled },
 }, {
-	name: knobStream, icon: tgemoji.IDWrite, title: "Ответ по мере написания",
+	name: knobStream, icon: tgemoji.IDWrite, title: "Ответ по мере написания (личка)",
 	label: func(v settings.Values) string {
 		return "Стриминг: " + onOffShort(v.StreamEnabled)
 	},

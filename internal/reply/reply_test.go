@@ -45,8 +45,21 @@ type fakeSender struct {
 	sendPhotoErr   error
 	editMediaErr   error
 	sendMessageErr error
+	richSendErr    error // returned for a finished rich answer
+	draftErr       error // returned for a streamed draft
 
 	direct []directCall
+	rich   []directCall
+	drafts []draftCall
+}
+
+// draftCall is one streamed draft: either a "thinking" status or the partial
+// answer, never both.
+type draftCall struct {
+	chatID   int64
+	draftID  int
+	thinking string
+	text     string
 }
 
 // directCall is one private-chat message.
@@ -131,6 +144,42 @@ func (f *fakeSender) SendMessage(_ context.Context, p *telego.SendMessageParams)
 	return &telego.Message{MessageID: testDirectMessageID}, nil
 }
 
+func (f *fakeSender) SendRichMessage(_ context.Context, p *telego.SendRichMessageParams) (*telego.Message, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.rich = append(f.rich, directCall{chatID: p.ChatID.ID, text: p.RichMessage.Markdown})
+	if f.richSendErr != nil {
+		return nil, f.richSendErr
+	}
+	return &telego.Message{MessageID: testDirectMessageID}, nil
+}
+
+func (f *fakeSender) SendRichMessageDraft(_ context.Context, p *telego.SendRichMessageDraftParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	call := draftCall{chatID: p.ChatID, draftID: p.DraftID}
+	for _, block := range p.RichMessage.Blocks {
+		switch b := block.(type) {
+		case *telego.InputRichBlockThinking:
+			call.thinking = plainText(b.Text)
+		case *telego.InputRichBlockParagraph:
+			call.text = plainText(b.Text)
+		}
+	}
+	f.drafts = append(f.drafts, call)
+	return f.draftErr
+}
+
+// plainText unwraps the only kind of rich text the drafts use.
+func plainText(text telego.RichText) string {
+	if plain, ok := text.(*telego.RichTextPlain); ok {
+		return string(*plain)
+	}
+	return ""
+}
+
 func (f *fakeSender) SendPhoto(_ context.Context, p *telego.SendPhotoParams) (*telego.Message, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -174,6 +223,18 @@ func (f *fakeSender) directs() []directCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]directCall(nil), f.direct...)
+}
+
+func (f *fakeSender) richSends() []directCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]directCall(nil), f.rich...)
+}
+
+func (f *fakeSender) draftCalls() []draftCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]draftCall(nil), f.drafts...)
 }
 
 func (f *fakeSender) pictures() ([]photoCall, []mediaCall) {
@@ -1505,7 +1566,7 @@ func directMessage(from int64, text string) telego.Message {
 	}
 }
 
-func TestDirectMessageShowsAPlaceholderThenTheAnswer(t *testing.T) {
+func TestDirectMessageStreamsADraftThenSendsTheAnswer(t *testing.T) {
 	sender := &fakeSender{}
 	model := &fakeModel{answer: "# Ответ\n\nВот **таблица**."}
 	h := newHandler(sender, model, handlerOpts{})
@@ -1514,26 +1575,35 @@ func TestDirectMessageShowsAPlaceholderThenTheAnswer(t *testing.T) {
 		t.Fatalf("HandleDirectMessage() error = %v", err)
 	}
 
-	directs := sender.directs()
-	if len(directs) != 1 {
-		t.Fatalf("sent %d messages, want just the placeholder", len(directs))
+	// Silence for the seconds an answer takes reads as a broken bot, so the
+	// draft goes out before the model is even called. Telegram animates it for
+	// us, which is why no placeholder message is posted any more.
+	drafts := sender.draftCalls()
+	if len(drafts) == 0 {
+		t.Fatal("drafts = none, want a thinking draft while the answer is written")
 	}
-	// Silence for the seconds an answer takes reads as a broken bot.
-	if !strings.Contains(directs[0].text, "tg-emoji") || directs[0].parseMode != telego.ModeHTML {
-		t.Errorf("placeholder = %+v, want the custom emoji as HTML", directs[0])
+	if drafts[0].chatID != 111 || drafts[0].draftID == 0 {
+		t.Errorf("draft = %+v, want the private chat and a non-zero id", drafts[0])
+	}
+	if drafts[0].thinking == "" {
+		t.Errorf("draft = %+v, want the native thinking block first", drafts[0])
+	}
+	if got := sender.directs(); len(got) != 0 {
+		t.Errorf("plain messages = %+v, want none: the draft replaces the placeholder", got)
 	}
 
-	_, edits := sender.snapshot()
-	if len(edits) != 1 {
-		t.Fatalf("edits = %+v, want the placeholder replaced", edits)
+	// The draft is a 30-second preview and is never persisted, so the finished
+	// answer is a message of its own. Rich markdown is what carries headings and
+	// tables; the legacy parse mode cannot render either.
+	rich := sender.richSends()
+	if len(rich) != 1 {
+		t.Fatalf("rich messages = %+v, want exactly the finished answer", rich)
 	}
-	if edits[0].chatID != 111 || edits[0].messageID != testDirectMessageID {
-		t.Errorf("edit targeted %d/%d, want the placeholder we just sent", edits[0].chatID, edits[0].messageID)
+	if rich[0].chatID != 111 || rich[0].text != model.answer {
+		t.Errorf("answer = %+v, want the answer as a rich message in the chat", rich[0])
 	}
-	// Rich markdown is what carries headings and tables; the legacy parse mode
-	// cannot render either.
-	if edits[0].markdown != model.answer {
-		t.Errorf("edit = %q, want the answer as a rich message", edits[0].markdown)
+	if _, edits := sender.snapshot(); len(edits) != 0 {
+		t.Errorf("edits = %+v, want none: nothing is edited in a private chat any more", edits)
 	}
 }
 
@@ -1736,7 +1806,7 @@ func (m *streamingModel) Stream(_ context.Context, _ llm.Request, sink llm.Sink)
 	return whole.String(), nil
 }
 
-func TestStreamingShowsTheAnswerBeforeItIsFinished(t *testing.T) {
+func TestStreamingGrowsTheDraftBeforeTheAnswerIsFinished(t *testing.T) {
 	sender := &fakeSender{}
 	release := make(chan struct{})
 	model := &streamingModel{pieces: []string{"Первое ", "второе ", "третье"}, release: release}
@@ -1755,35 +1825,73 @@ func TestStreamingShowsTheAnswerBeforeItIsFinished(t *testing.T) {
 	h.SetStreaming(true)
 
 	done := make(chan error, 1)
-	go func() { done <- h.HandleGuestMessage(context.Background(), guestMessage("@dr1wbot привет")) }()
+	go func() { done <- h.HandleDirectMessage(context.Background(), directMessage(111, "привет")) }()
 
-	// Let each piece through, giving the editor time to push it into the chat.
+	// Let each piece through, giving the draft time to carry it into the chat.
 	for range model.pieces {
 		time.Sleep(10 * time.Millisecond)
 		release <- struct{}{}
 	}
 	if err := <-done; err != nil {
+		t.Fatalf("HandleDirectMessage() error = %v", err)
+	}
+
+	drafts := sender.draftCalls()
+	if len(drafts) < 2 {
+		t.Fatalf("drafts = %+v, want the answer shown while it is written", drafts)
+	}
+	// Every draft is one animation step of the same draft, so they share an id.
+	for _, d := range drafts {
+		if d.draftID != drafts[0].draftID {
+			t.Fatalf("draft ids = %+v, want one draft animated in place", drafts)
+		}
+	}
+	// A partial answer is unformatted: half-written Markdown is not valid
+	// Markdown, and the finished answer is a different message.
+	partial := drafts[len(drafts)-1]
+	if partial.text == "" || !strings.HasPrefix("Первое второе третье", partial.text) {
+		t.Errorf("last draft = %+v, want a prefix of the answer as plain text", partial)
+	}
+
+	rich := sender.richSends()
+	if len(rich) != 1 || rich[0].text != "Первое второе третье" {
+		t.Errorf("rich messages = %+v, want the finished answer sent once", rich)
+	}
+}
+
+func TestGuestAnswerIsNeverStreamed(t *testing.T) {
+	sender := &fakeSender{}
+	model := &streamingModel{pieces: []string{"раз ", "два"}}
+
+	h := New(Options{
+		Sender:        sender,
+		Model:         model,
+		Access:        allowAll,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		BotUsername:   "dr1wbot",
+		MaxConcurrent: 4,
+		MaxReplyRunes: 3500,
+		Timeout:       time.Second,
+		StreamEvery:   time.Millisecond,
+	})
+	h.SetStreaming(true)
+
+	if err := h.HandleGuestMessage(context.Background(), guestMessage("@dr1wbot привет")); err != nil {
 		t.Fatalf("HandleGuestMessage() error = %v", err)
 	}
 
+	// Guest mode answers an inline message that drafts cannot address, and
+	// editing one over and over is what the drafts replaced. So the guest path
+	// waits and answers once.
 	_, edits := sender.snapshot()
-	if len(edits) < 2 {
-		t.Fatalf("edits = %+v, want the answer shown while it is written and once at the end", edits)
+	if len(edits) != 1 {
+		t.Fatalf("edits = %+v, want exactly one: the finished answer", edits)
 	}
-
-	// Everything before the last edit is a partial answer: unformatted, with a
-	// cursor, because half-written Markdown is not valid Markdown.
-	partial := edits[len(edits)-2]
-	if partial.markdown != "" {
-		t.Errorf("partial edit = %+v, want plain text while streaming", partial)
+	if edits[0].markdown != "раз два" {
+		t.Errorf("edit = %+v, want the whole answer at once", edits[0])
 	}
-	if !strings.HasSuffix(partial.plain, streamCursor) {
-		t.Errorf("partial edit = %q, want a cursor on an unfinished answer", partial.plain)
-	}
-
-	final := edits[len(edits)-1]
-	if final.markdown != "Первое второе третье" {
-		t.Errorf("final edit = %+v, want the finished answer as rich markdown", final)
+	if got := sender.draftCalls(); len(got) != 0 {
+		t.Errorf("drafts = %+v, want none outside a private chat", got)
 	}
 }
 
@@ -1804,14 +1912,19 @@ func TestStreamingCanBeSwitchedOff(t *testing.T) {
 	})
 	h.SetStreaming(false)
 
-	if err := h.HandleGuestMessage(context.Background(), guestMessage("@dr1wbot привет")); err != nil {
-		t.Fatalf("HandleGuestMessage() error = %v", err)
+	if err := h.HandleDirectMessage(context.Background(), directMessage(111, "привет")); err != nil {
+		t.Fatalf("HandleDirectMessage() error = %v", err)
 	}
-	_, edits := sender.snapshot()
-	if len(edits) != 1 {
-		t.Fatalf("edits = %+v, want exactly one: the finished answer", edits)
+
+	// The draft still says "thinking" — that is the placeholder, not streaming
+	// — but no half-written answer is ever shown.
+	for _, d := range sender.draftCalls() {
+		if d.text != "" {
+			t.Errorf("draft = %+v, want no partial answer with streaming off", d)
+		}
 	}
-	if edits[0].markdown != "раз два" {
-		t.Errorf("edit = %+v, want the whole answer at once", edits[0])
+	rich := sender.richSends()
+	if len(rich) != 1 || rich[0].text != "раз два" {
+		t.Errorf("rich messages = %+v, want the whole answer at once", rich)
 	}
 }
