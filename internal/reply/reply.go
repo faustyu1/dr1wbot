@@ -69,6 +69,22 @@ type Rationer interface {
 	Judge(userID int64) (verdict quota.Verdict, used, limit int)
 }
 
+// Bouncer answers "is this person banned", which is a different question from
+// "has this person spent their allowance": a ban applies to everybody, the
+// whitelist included, and it is checked before anything else happens.
+type Bouncer interface {
+	// Note records the @username an id is using, which is the only way a ban
+	// placed on a name can ever be pinned to a person.
+	Note(userID int64, username string) bool
+	Blocked(userID int64, username string) (quota.Ban, bool)
+}
+
+// Streamer is a model that can report an answer as it is written. A model that
+// cannot is used through Completer, and the answer simply arrives at once.
+type Streamer interface {
+	Stream(ctx context.Context, req llm.Request, sink llm.Sink) (string, error)
+}
+
 // Cache serves repeated questions without going to the model.
 type Cache interface {
 	Enabled() bool
@@ -129,6 +145,22 @@ func msgQuotaSpent(limit int) string {
 // captionLimit is Telegram's cap on a photo caption.
 const captionLimit = 1024
 
+// defaultStreamEvery is how often a half-written answer is pushed into the
+// chat. Telegram throttles edits of one message, and an answer that flickers
+// several times a second is harder to read than one that arrives in steps.
+const defaultStreamEvery = 1500 * time.Millisecond
+
+// streamCursor marks the end of a partial answer, so a message that stops
+// mid-sentence reads as "still writing" rather than as "this is the answer".
+const streamCursor = " ▍"
+
+// msgSearching is what the chat shows while the model looks something up. The
+// query is included because it is the interesting part: it says what the bot
+// understood the question to be about.
+func msgSearching(query string) string {
+	return "🔎 Ищу в интернете: " + query
+}
+
 // Handler answers guest queries.
 type Handler struct {
 	sender      Sender
@@ -138,6 +170,8 @@ type Handler struct {
 	recall      Remembrancer       // nil disables conversation history
 	allow       Gatekeeper
 	ration      Rationer // nil keeps the bot whitelist-only
+	bouncer     Bouncer  // nil disables bans
+	streamer    Streamer // nil means the answer always arrives at once
 	cache       Cache    // nil disables the repeat-question cache
 	alerts      Notifier // nil disables admin alerts
 	commands    Commander
@@ -160,6 +194,8 @@ type Handler struct {
 	maxQueue int
 
 	rawFlagOff      bool
+	streamOff       bool
+	streamEvery     time.Duration
 	botID           int64
 	botUsername     string
 	storageChatID   int64
@@ -174,13 +210,15 @@ type Handler struct {
 
 // Options configures a Handler.
 type Options struct {
-	Sender   Sender
-	Model    llm.Completer
-	Images   imagegen.Generator
-	Files    Downloader
-	Memory   Remembrancer
-	Access   Gatekeeper
-	Quota    Rationer
+	Sender Sender
+	Model  llm.Completer
+	Images imagegen.Generator
+	Files  Downloader
+	Memory Remembrancer
+	Access Gatekeeper
+	Quota  Rationer
+	// Bans is checked before anything else on every message. Nil disables bans.
+	Bans     Bouncer
 	Cache    Cache
 	Alerts   Notifier
 	Commands Commander
@@ -210,6 +248,10 @@ type Options struct {
 	// MaxQueue bounds how many summons may wait for a worker. Zero means an
 	// unbounded line.
 	MaxQueue int
+	// StreamEvery is how often a partially written answer is pushed into the
+	// chat. Telegram rate-limits edits per message, so this is a floor on how
+	// often the text may change, not a target.
+	StreamEvery time.Duration
 }
 
 // New builds a Handler.
@@ -220,7 +262,16 @@ func New(opts Options) *Handler {
 	if opts.ImageTimeout <= 0 {
 		opts.ImageTimeout = 2 * time.Minute
 	}
+	if opts.StreamEvery <= 0 {
+		opts.StreamEvery = defaultStreamEvery
+	}
+	// A model that can stream is used that way; one that cannot is not a
+	// configuration error, it just answers all at once.
+	streamer, _ := opts.Model.(Streamer)
 	return &Handler{
+		streamer:      streamer,
+		bouncer:       opts.Bans,
+		streamEvery:   opts.StreamEvery,
 		after:         func(d time.Duration, f func()) { time.AfterFunc(d, f) },
 		sender:        opts.Sender,
 		model:         opts.Model,
@@ -260,6 +311,21 @@ func (h *Handler) SetPublicPolicy(maxTokens, maxRunes int) {
 	h.publicMaxRunes = maxRunes
 }
 
+// SetStreaming turns the written-as-you-watch answer on and off. Off means one
+// edit with the finished text, which is what a slow or rate-limited chat wants.
+func (h *Handler) SetStreaming(on bool) {
+	h.policy.Lock()
+	defer h.policy.Unlock()
+	h.streamOff = !on
+}
+
+// streaming reports whether answers are shown as they are written.
+func (h *Handler) streaming() bool {
+	h.policy.RLock()
+	defer h.policy.RUnlock()
+	return h.streamer != nil && !h.streamOff
+}
+
 // SetRawFlagEnabled turns the admin "-s" flag on and off without a restart.
 // Disabling it keeps the configured prompt so the switch is reversible.
 func (h *Handler) SetRawFlagEnabled(on bool) {
@@ -295,6 +361,14 @@ func (h *Handler) HandleGuestMessage(ctx context.Context, msg telego.Message) er
 		userID = msg.From.ID
 	}
 	log := h.log.With("chat_id", msg.Chat.ID, "user_id", userID)
+
+	if h.blocked(msg.From) {
+		// Silence, deliberately: a reply is the feedback somebody testing a ban
+		// is looking for, and sending one is a request we make on the bot's
+		// behalf for every message they send.
+		log.Info("ignoring a banned caller")
+		return nil
+	}
 
 	privileged := h.allow.Allowed(userID, msg.Chat.ID)
 	if !privileged && !h.publicOpen() {
@@ -375,6 +449,11 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 	userID := msg.From.ID
 	log := h.log.With("chat_id", msg.Chat.ID, "user_id", userID, "direct", true)
 
+	if h.blocked(msg.From) {
+		log.Info("ignoring a banned caller")
+		return nil
+	}
+
 	privileged := h.allow.Allowed(userID, msg.Chat.ID)
 	if !privileged && !h.publicOpen() {
 		log.Debug("direct message rejected: not whitelisted")
@@ -438,11 +517,13 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 	// A private chat is a real conversation, so every message continues it —
 	// there is no reply-to signal to wait for the way guest mode needs one.
 	started := time.Now()
-	answer, err := h.model.Complete(llmCtx, llm.Request{
+	answer, err := h.think(llmCtx, log, llm.Request{
 		Prompt:    question,
 		History:   h.history(msg.Chat.ID, true),
 		System:    system,
 		MaxTokens: budget,
+	}, func(text string) error {
+		return h.editChatPlain(ctx, msg.Chat.ID, messageID, text)
 	})
 	if err != nil {
 		log.Error("llm call failed", "err", err, "took", time.Since(started))
@@ -686,12 +767,14 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 	}
 
 	started := time.Now()
-	answer, err := h.model.Complete(llmCtx, llm.Request{
+	answer, err := h.think(llmCtx, log, llm.Request{
 		Prompt:    prompt,
 		Images:    attachments,
 		History:   h.history(msg.Chat.ID, followUp),
 		System:    system,
 		MaxTokens: budget,
+	}, func(text string) error {
+		return h.editPlain(ctx, inlineID, text)
 	})
 	if err != nil {
 		if errors.Is(err, llm.ErrRateLimited) {
@@ -724,6 +807,108 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 	}
 
 	return h.editText(ctx, inlineID, mdtext.Truncate(answer, h.maxReplyRunes))
+}
+
+// live holds the newest version of a partially written answer, so the editor
+// goroutine can push it into the chat at its own pace instead of once per
+// token. Telegram rate-limits edits per message; the model does not.
+type live struct {
+	mu    sync.Mutex
+	text  string
+	dirty bool
+}
+
+// put replaces what should be shown next.
+func (l *live) put(text string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if text == l.text {
+		return
+	}
+	l.text, l.dirty = text, true
+}
+
+// take returns the newest text once, or reports that nothing changed. Telegram
+// rejects an edit that would not change the message, so an unchanged answer
+// must not be sent again.
+func (l *live) take() (string, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.dirty {
+		return "", false
+	}
+	l.dirty = false
+	return l.text, true
+}
+
+// think runs the model. When streaming is on, show is called with the answer as
+// it grows; otherwise it is never called and the answer arrives once, whole.
+//
+// The streaming text is deliberately unformatted: half of a Markdown table or
+// an unclosed code fence is not valid markup, and Telegram rejects the edit
+// rather than rendering it. The finished answer is what gets the formatting.
+func (h *Handler) think(ctx context.Context, log *slog.Logger, req llm.Request, show func(string) error) (string, error) {
+	if !h.streaming() || show == nil {
+		return h.model.Complete(ctx, req)
+	}
+
+	l := &live{}
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(h.streamEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				text, changed := l.take()
+				if !changed {
+					continue
+				}
+				if err := show(text); err != nil {
+					// A rejected intermediate edit is not worth failing over:
+					// the finished answer is written by a different call.
+					log.Debug("could not show the answer as it is written", "err", err)
+				}
+			}
+		}
+	}()
+
+	answer, err := h.streamer.Stream(ctx, req, func(e llm.Event) {
+		switch {
+		case e.Searching != "":
+			l.put(msgSearching(e.Searching))
+		case e.Text != "":
+			l.put(mdtext.Truncate(e.Text, h.maxReplyRunes) + streamCursor)
+		}
+	})
+
+	// Stopping before returning is what guarantees no half-written text lands
+	// after the finished answer: the caller edits the message next.
+	close(stop)
+	<-done
+	return answer, err
+}
+
+// blocked reports whether this caller is banned, and remembers the @username
+// they are writing under so a ban placed on a name can find them.
+//
+// A ban is checked before the whitelist and before the allowance, because it
+// applies to everybody: somebody an admin banned does not get answers by virtue
+// of also being on the access list. Admins are exempt — a bot whose owner can
+// lock themselves out of it is a bot with a footgun.
+func (h *Handler) blocked(from *telego.User) bool {
+	if h.bouncer == nil || from == nil || from.ID == 0 {
+		return false
+	}
+	if h.allow.IsAdmin(from.ID) {
+		return false
+	}
+	h.bouncer.Note(from.ID, from.Username)
+	_, banned := h.bouncer.Blocked(from.ID, from.Username)
+	return banned
 }
 
 // history returns what we remember of this conversation. A summon that is not a
@@ -1024,6 +1209,36 @@ func (h *Handler) editText(parent context.Context, inlineMessageID, text string)
 		return errors.Join(err, plainErr)
 	}
 	return nil
+}
+
+// editPlain replaces an inline message with unformatted text. It is what the
+// streaming path uses: a half-written answer is usually half-written markup
+// too, and Telegram rejects the edit rather than rendering it.
+func (h *Handler) editPlain(parent context.Context, inlineMessageID, text string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), editTimeout)
+	defer cancel()
+
+	_, err := h.sender.EditMessageText(ctx, &telego.EditMessageTextParams{
+		InlineMessageID:    inlineMessageID,
+		Text:               text,
+		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
+	})
+	return err
+}
+
+// editChatPlain is editPlain for a private chat, which has a message id rather
+// than an inline one.
+func (h *Handler) editChatPlain(parent context.Context, chatID int64, messageID int, text string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), editTimeout)
+	defer cancel()
+
+	_, err := h.sender.EditMessageText(ctx, &telego.EditMessageTextParams{
+		ChatID:             telego.ChatID{ID: chatID},
+		MessageID:          messageID,
+		Text:               text,
+		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
+	})
+	return err
 }
 
 // markdown wraps text as a rich message.

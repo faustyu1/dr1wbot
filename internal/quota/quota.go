@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -76,6 +77,30 @@ type user struct {
 	// Seen is the last time this caller asked anything, which is what orders
 	// the panel's list of people to ban.
 	Seen time.Time `json:"seen,omitempty"`
+	// Name is the last @username this id was seen under, lowercased and without
+	// the @. Telegram offers no way to look an id up by name, so the only
+	// directory that can exist is the one the bot builds from what walks past.
+	Name string `json:"name,omitempty"`
+	// Manual marks a ban an admin placed by hand. The flood detector's bans
+	// expire and are forgiven; a hand-placed one is a decision, and the panel
+	// says which is which.
+	Manual bool `json:"manual,omitempty"`
+}
+
+// nameBan is a ban placed on a @username rather than on an id.
+//
+// It exists because /ban is useful exactly when the target is somebody an admin
+// can see in a chat but whose numeric id they do not have — and because
+// Telegram has no username-to-id lookup, so the ban has to wait for its target
+// to show up before it can be pinned to an id. Until then it lives here and is
+// applied the first moment that name sends anything.
+type nameBan struct {
+	Until   time.Time `json:"until,omitempty"`
+	Forever bool      `json:"forever,omitempty"`
+	// ID is the id the name resolved to, once it has. Zero means the name has
+	// not been seen since the ban was placed.
+	ID int64     `json:"id,omitempty"`
+	At time.Time `json:"at,omitempty"`
 }
 
 // Store counts today's requests per user and sidelines the ones that abuse it.
@@ -94,6 +119,7 @@ type Store struct {
 
 	day        string // UTC date the counters belong to
 	users      map[int64]*user
+	nameBans   map[string]*nameBan
 	globalUsed int
 
 	path string // empty disables persistence
@@ -138,9 +164,10 @@ type Options struct {
 // persisted is the on-disk format. Callers are keyed by user id as a string
 // because that is what JSON objects allow.
 type persisted struct {
-	Day        string           `json:"day"`
-	Users      map[string]*user `json:"users"`
-	GlobalUsed int              `json:"global_used,omitempty"`
+	Day        string              `json:"day"`
+	Users      map[string]*user    `json:"users"`
+	Names      map[string]*nameBan `json:"names,omitempty"`
+	GlobalUsed int                 `json:"global_used,omitempty"`
 }
 
 // New builds a Store and reloads today's counters if they are still current.
@@ -173,12 +200,15 @@ func New(opts Options) (*Store, error) {
 		warnTTL:     opts.WarnTTL,
 		maxWarns:    opts.MaxWarns,
 		users:       make(map[int64]*user),
+		nameBans:    make(map[string]*nameBan),
 		path:        opts.File,
 		now:         opts.Now,
 	}
 	s.day = today(s.now())
 
-	if s.path == "" || s.limit <= 0 {
+	// A closed bot still loads the file: bans are the operator's decisions, and
+	// they must not evaporate because public access happens to be off.
+	if s.path == "" {
 		return s, nil
 	}
 
@@ -194,6 +224,12 @@ func New(opts Options) (*Store, error) {
 	if err := json.Unmarshal(raw, &loaded); err != nil {
 		return nil, fmt.Errorf("parse quota %s: %w", s.path, err)
 	}
+	for name, nb := range loaded.Names {
+		if nb == nil || !liveName(nb, s.now()) {
+			continue // an expired name ban is not worth carrying forward
+		}
+		s.nameBans[name] = nb
+	}
 	if loaded.Day != s.day {
 		// Yesterday's counters are stale, but an unexpired ban is not: a script
 		// must not be able to wash one off by waiting for midnight.
@@ -202,7 +238,8 @@ func New(opts Options) (*Store, error) {
 			if err != nil || u == nil || !s.bannedLocked(u, s.now()) {
 				continue
 			}
-			s.users[id] = &user{Warns: u.Warns, BannedUntil: u.BannedUntil, Forever: u.Forever}
+			s.users[id] = &user{Name: u.Name, Manual: u.Manual, Warns: u.Warns,
+				BannedUntil: u.BannedUntil, Forever: u.Forever}
 		}
 		return s, nil
 	}
@@ -385,76 +422,255 @@ func (s *Store) BannedUntil(userID int64) time.Time {
 	return u.BannedUntil
 }
 
-// Ban sidelines a caller by hand. The panel needs this because the burst
-// detector only catches speed: somebody can be a nuisance at a perfectly human
-// pace, and that is a judgement call, not a threshold.
+// Ban sidelines a caller by hand. A zero or negative duration means forever:
+// that is what an admin who typed no time meant, and a ban that quietly expires
+// because nobody named a number is worse than no ban at all.
+//
+// This exists because the burst detector only catches speed: somebody can be a
+// nuisance at a perfectly human pace, and that is a judgement call, not a
+// threshold.
 func (s *Store) Ban(userID int64, d time.Duration) {
-	if d <= 0 {
-		d = s.banFor
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	u := s.userLocked(userID)
-	u.BannedUntil = s.now().Add(d)
-	u.Recent = nil
+	s.banLocked(s.userLocked(userID), d)
 	s.saveLocked()
 }
 
-// Caller is one person the panel can act on.
-type Caller struct {
-	ID    int64
-	Used  int
-	Limit int
-	// Until is when a ban lifts; zero means they are in good standing or the
-	// ban is permanent, which Forever tells apart.
-	Until   time.Time
-	Forever bool
-	Warns   int
-	Seen    time.Time
+// banLocked applies a hand-placed ban to one record. Requires the lock.
+func (s *Store) banLocked(u *user, d time.Duration) {
+	u.Manual = true
+	u.Recent = nil
+	if d <= 0 {
+		u.Forever = true
+		u.BannedUntil = time.Time{}
+		return
+	}
+	u.Forever = false
+	u.BannedUntil = s.now().Add(d)
 }
 
-// Banned reports whether this caller is sidelined right now.
-func (c Caller) Banned() bool { return c.Forever || !c.Until.IsZero() }
-
-// Callers lists today's public users, banned ones first and then the most
-// recently active, capped at max. It exists because an inline keyboard has
-// nowhere to type an id into: the only way to offer a ban button is to build
-// one per person the bot already knows about.
-func (s *Store) Callers(max int) []Caller {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.rolloverLocked()
-
-	now := s.now()
-	out := make([]Caller, 0, len(s.users))
-	for id, u := range s.users {
-		c := Caller{
-			ID:    id,
-			Used:  u.Used,
-			Limit: s.allowanceLocked(id),
-			Seen:  u.Seen,
-			Warns: len(pruneWarns(u.Warns, now.Add(-s.warnTTL))),
-		}
-		if s.bannedLocked(u, now) {
-			c.Until, c.Forever = u.BannedUntil, u.Forever
-		}
-		out = append(out, c)
+// BanName sidelines a @username. It reports the id the name was pinned to, or
+// zero when the bot has never seen it: Telegram has no username-to-id lookup, so
+// a name nobody has spoken under yet can only be remembered and applied the
+// moment it appears.
+func (s *Store) BanName(username string, d time.Duration) (id int64, known bool) {
+	name := normalName(username)
+	if name == "" {
+		return 0, false
 	}
 
-	slices.SortFunc(out, func(a, b Caller) int {
-		// Banned first: those are the ones an admin came here to review.
-		if banned := boolCmp(a.Banned(), b.Banned()); banned != 0 {
-			return banned
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	nb := &nameBan{At: s.now()}
+	if d <= 0 {
+		nb.Forever = true
+	} else {
+		nb.Until = s.now().Add(d)
+	}
+
+	if u, uid := s.byNameLocked(name); u != nil {
+		s.banLocked(u, d)
+		nb.ID = uid
+		id, known = uid, true
+	}
+	s.nameBans[name] = nb
+	s.saveLocked()
+	return id, known
+}
+
+// Note records the @username an id is currently using and applies any ban that
+// was placed on that name before the bot knew who it belonged to.
+//
+// It reports whether the caller was banned by name just now, which is the one
+// case where the answer to "is this person banned" changes as a side effect of
+// asking who they are.
+func (s *Store) Note(userID int64, username string) (bannedNow bool) {
+	name := normalName(username)
+	if name == "" || userID == 0 {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	nb, pending := s.nameBans[name]
+	if pending && !liveName(nb, s.now()) {
+		delete(s.nameBans, name)
+		pending = false
+	}
+
+	u, existing := s.users[userID]
+	if !existing && !pending {
+		// Nothing to remember about somebody with no record and no ban waiting:
+		// a whitelisted regular should not grow an entry per message.
+		return false
+	}
+	if !existing {
+		u = s.userLocked(userID)
+	}
+
+	changed := u.Name != name
+	u.Name = name
+
+	if pending {
+		u.Manual = true
+		u.Forever = nb.Forever
+		u.BannedUntil = nb.Until
+		u.Recent = nil
+		if nb.ID != userID {
+			nb.ID = userID
+			changed = true
 		}
-		return b.Seen.Compare(a.Seen)
+		bannedNow = true
+	}
+	if changed || bannedNow {
+		s.saveLocked()
+	}
+	return bannedNow
+}
+
+// Ban describes one sidelined caller for the panel and for /bans.
+type Ban struct {
+	// ID is zero for a ban that is still waiting for its username to appear.
+	ID       int64
+	Username string
+	// Until is when the ban lifts; zero with Forever set means never.
+	Until   time.Time
+	Forever bool
+	// Manual tells a decision apart from what the flood detector did on its own.
+	Manual bool
+	Warns  int
+}
+
+// Active reports whether this ban is in force.
+func (b Ban) Active() bool { return b.Forever || !b.Until.IsZero() }
+
+// Blocked reports whether this caller is sidelined right now, by id or by name.
+// It books nothing and changes nothing: unlike Judge, it is asked on every
+// message, including from people the whitelist would otherwise wave through — a
+// ban that only applies to strangers is not a ban.
+func (s *Store) Blocked(userID int64, username string) (Ban, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := s.now()
+	if u, ok := s.users[userID]; ok && s.bannedLocked(u, now) {
+		return Ban{
+			ID: userID, Username: u.Name, Until: u.BannedUntil, Forever: u.Forever,
+			Manual: u.Manual, Warns: len(pruneWarns(u.Warns, now.Add(-s.warnTTL))),
+		}, true
+	}
+	if name := normalName(username); name != "" {
+		if nb, ok := s.nameBans[name]; ok && liveName(nb, now) {
+			return Ban{ID: userID, Username: name, Until: nb.Until, Forever: nb.Forever, Manual: true}, true
+		}
+	}
+	return Ban{}, false
+}
+
+// Bans lists every ban in force, hand-placed ones first. It is what the panel
+// shows and what /bans prints.
+func (s *Store) Bans(max int) []Ban {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := s.now()
+	out := make([]Ban, 0, len(s.users)+len(s.nameBans))
+	seen := make(map[int64]struct{}, len(s.users))
+
+	for id, u := range s.users {
+		if !s.bannedLocked(u, now) {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, Ban{
+			ID: id, Username: u.Name, Until: u.BannedUntil, Forever: u.Forever,
+			Manual: u.Manual, Warns: len(pruneWarns(u.Warns, now.Add(-s.warnTTL))),
+		})
+	}
+	for name, nb := range s.nameBans {
+		if !liveName(nb, now) {
+			continue
+		}
+		if _, already := seen[nb.ID]; already && nb.ID != 0 {
+			continue // the same ban, already listed under its id
+		}
+		out = append(out, Ban{Username: name, Until: nb.Until, Forever: nb.Forever, Manual: true})
+	}
+
+	slices.SortFunc(out, func(a, b Ban) int {
+		if manual := boolCmp(a.Manual, b.Manual); manual != 0 {
+			return manual
+		}
+		if forever := boolCmp(a.Forever, b.Forever); forever != 0 {
+			return forever
+		}
+		return a.Until.Compare(b.Until)
 	})
 
 	if max > 0 && len(out) > max {
 		out = out[:max]
 	}
 	return out
+}
+
+// byNameLocked finds the caller last seen under a username. Requires the lock.
+func (s *Store) byNameLocked(name string) (*user, int64) {
+	for id, u := range s.users {
+		if u.Name == name {
+			return u, id
+		}
+	}
+	return nil, 0
+}
+
+// liveName reports whether a name ban is still in force.
+func liveName(nb *nameBan, now time.Time) bool {
+	return nb != nil && (nb.Forever || now.Before(nb.Until))
+}
+
+// dropExpiredNamesLocked forgets name bans that have run out. Requires the lock.
+func (s *Store) dropExpiredNamesLocked() {
+	now := s.now()
+	for name, nb := range s.nameBans {
+		if !liveName(nb, now) {
+			delete(s.nameBans, name)
+		}
+	}
+}
+
+// normalName turns whatever an admin typed into the key a username is stored
+// under: no leading @, no case, no surrounding link.
+func normalName(username string) string {
+	name := strings.TrimSpace(username)
+	name = strings.TrimPrefix(name, "https://t.me/")
+	name = strings.TrimPrefix(name, "t.me/")
+	name = strings.TrimPrefix(name, "@")
+	if name == "" || strings.ContainsAny(name, " /@") {
+		return ""
+	}
+	return strings.ToLower(name)
+}
+
+// Lookup resolves a @username to the id it was last seen under.
+func (s *Store) Lookup(username string) (int64, bool) {
+	name := normalName(username)
+	if name == "" {
+		return 0, false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, id := s.byNameLocked(name); id != 0 {
+		return id, true
+	}
+	if nb, ok := s.nameBans[name]; ok && nb.ID != 0 {
+		return nb.ID, true
+	}
+	return 0, false
 }
 
 func boolCmp(a, b bool) int {
@@ -469,16 +685,59 @@ func boolCmp(a, b bool) int {
 }
 
 // Pardon clears a ban and its history, so an admin can undo a false positive.
+// It also lifts the ban on whatever username this caller is known by: leaving
+// that behind would re-ban them on their very next message.
 func (s *Store) Pardon(userID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	u := s.userLocked(userID)
+	clearBan(u)
+	if u.Name != "" {
+		delete(s.nameBans, u.Name)
+	}
+	s.saveLocked()
+}
+
+// PardonName lifts a ban placed on a @username, and on the id it resolved to.
+// It reports whether anything was actually lifted, so /unban can say so.
+func (s *Store) PardonName(username string) bool {
+	name := normalName(username)
+	if name == "" {
+		return false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	nb, pending := s.nameBans[name]
+	delete(s.nameBans, name)
+
+	lifted := pending && liveName(nb, s.now())
+	if u, _ := s.byNameLocked(name); u != nil {
+		if s.bannedLocked(u, s.now()) {
+			lifted = true
+		}
+		clearBan(u)
+	} else if nb != nil && nb.ID != 0 {
+		if u, ok := s.users[nb.ID]; ok {
+			if s.bannedLocked(u, s.now()) {
+				lifted = true
+			}
+			clearBan(u)
+		}
+	}
+	s.saveLocked()
+	return lifted
+}
+
+// clearBan wipes everything that keeps a caller sidelined.
+func clearBan(u *user) {
 	u.BannedUntil = time.Time{}
 	u.Forever = false
+	u.Manual = false
 	u.Warns = nil
 	u.Recent = nil
-	s.saveLocked()
 }
 
 // userLocked returns the caller's record, creating it if needed. Requires the
@@ -546,8 +805,10 @@ func (s *Store) rolloverLocked() {
 			delete(s.users, id) // clean record, nothing left to remember
 			continue
 		}
-		s.users[id] = &user{Warns: u.Warns, BannedUntil: u.BannedUntil, Forever: u.Forever}
+		s.users[id] = &user{Name: u.Name, Manual: u.Manual, Warns: u.Warns,
+			BannedUntil: u.BannedUntil, Forever: u.Forever}
 	}
+	s.dropExpiredNamesLocked()
 	s.saveLocked()
 }
 
@@ -569,6 +830,7 @@ func (s *Store) saveLocked() {
 	snapshot := persisted{
 		Day:        s.day,
 		Users:      make(map[string]*user, len(s.users)),
+		Names:      s.nameBans,
 		GlobalUsed: s.globalUsed,
 	}
 	for id, u := range s.users {

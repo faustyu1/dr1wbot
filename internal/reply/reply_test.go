@@ -329,9 +329,11 @@ type handlerOpts struct {
 	commandReplyTTL time.Duration
 	rawSystemPrompt string
 	ration          Rationer
+	bans            Bouncer
 	files           Downloader
 	publicMaxTokens int
 	publicMaxRunes  int
+	streamEvery     time.Duration
 }
 
 func newHandler(sender Sender, model *fakeModel, o handlerOpts) *Handler {
@@ -364,6 +366,8 @@ func newHandler(sender Sender, model *fakeModel, o handlerOpts) *Handler {
 		CommandReplyTTL: o.commandReplyTTL,
 		RawSystemPrompt: o.rawSystemPrompt,
 		Quota:           o.ration,
+		Bans:            o.bans,
+		StreamEvery:     o.streamEvery,
 		Files:           o.files,
 		PublicMaxTokens: o.publicMaxTokens,
 		PublicMaxRunes:  o.publicMaxRunes,
@@ -1609,5 +1613,205 @@ func TestDirectMessageBannedCallerGetsSilence(t *testing.T) {
 	}
 	if len(sender.directs()) != 0 {
 		t.Errorf("sent %+v, want nothing to a banned caller", sender.directs())
+	}
+}
+
+// fakeBouncer answers the ban question the way a test wants it answered.
+type fakeBouncer struct {
+	mu      sync.Mutex
+	banned  bool
+	noted   []string
+	notedID []int64
+}
+
+func (f *fakeBouncer) Note(id int64, username string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notedID = append(f.notedID, id)
+	f.noted = append(f.noted, username)
+	return false
+}
+
+func (f *fakeBouncer) Blocked(int64, string) (quota.Ban, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.banned {
+		return quota.Ban{}, false
+	}
+	return quota.Ban{ID: 111, Forever: true, Manual: true}, true
+}
+
+func TestABannedCallerIsIgnoredEvenWhenWhitelisted(t *testing.T) {
+	sender := &fakeSender{}
+	model := &fakeModel{answer: "не должно прозвучать"}
+	bouncer := &fakeBouncer{banned: true}
+	// allowAll stands for a whitelist that would otherwise let them through: a
+	// ban that only applies to strangers is not a ban.
+	h := newHandler(sender, model, handlerOpts{bans: bouncer})
+
+	if err := h.HandleGuestMessage(context.Background(), guestMessage("@dr1wbot привет")); err != nil {
+		t.Fatalf("HandleGuestMessage() error = %v", err)
+	}
+	if answers, _ := sender.snapshot(); len(answers) != 0 {
+		t.Errorf("answers = %v, want silence for a banned caller", answers)
+	}
+	if got := model.callCount(); got != 0 {
+		t.Errorf("model calls = %d, want none", got)
+	}
+}
+
+func TestABannedCallerIsIgnoredInPrivate(t *testing.T) {
+	sender := &fakeSender{}
+	model := &fakeModel{answer: "не должно прозвучать"}
+	h := newHandler(sender, model, handlerOpts{bans: &fakeBouncer{banned: true}})
+
+	msg := telego.Message{
+		Chat: telego.Chat{ID: 111, Type: telego.ChatTypePrivate},
+		From: &telego.User{ID: 111},
+		Text: "привет",
+	}
+	if err := h.HandleDirectMessage(context.Background(), msg); err != nil {
+		t.Fatalf("HandleDirectMessage() error = %v", err)
+	}
+	if got := sender.directs(); len(got) != 0 {
+		t.Errorf("direct messages = %+v, want silence", got)
+	}
+}
+
+func TestAnAdminIsNeverBanned(t *testing.T) {
+	sender := &fakeSender{}
+	model := &fakeModel{answer: "ответ"}
+	// A bot whose owner can lock themselves out of it is a bot with a footgun.
+	h := newHandler(sender, model, handlerOpts{bans: &fakeBouncer{banned: true}, access: adminGate})
+
+	if err := h.HandleGuestMessage(context.Background(), guestMessage("@dr1wbot привет")); err != nil {
+		t.Fatalf("HandleGuestMessage() error = %v", err)
+	}
+	if got := model.callCount(); got != 1 {
+		t.Errorf("model calls = %d, want the admin served", got)
+	}
+}
+
+func TestTheUsernameIsRememberedForBansByName(t *testing.T) {
+	sender := &fakeSender{}
+	bouncer := &fakeBouncer{}
+	h := newHandler(sender, &fakeModel{answer: "ответ"}, handlerOpts{bans: bouncer})
+
+	msg := guestMessage("@dr1wbot привет")
+	msg.From.Username = "someone"
+	if err := h.HandleGuestMessage(context.Background(), msg); err != nil {
+		t.Fatalf("HandleGuestMessage() error = %v", err)
+	}
+
+	bouncer.mu.Lock()
+	defer bouncer.mu.Unlock()
+	// Telegram has no username-to-id lookup, so this is the only directory that
+	// can exist: /ban @someone works because the bot saw them speak.
+	if len(bouncer.noted) != 1 || bouncer.noted[0] != "someone" || bouncer.notedID[0] != 111 {
+		t.Errorf("noted = %v/%v, want the username recorded against the id", bouncer.notedID, bouncer.noted)
+	}
+}
+
+// streamingModel writes an answer in pieces, like a real streamed completion.
+type streamingModel struct {
+	pieces []string
+	// release lets a test hold the stream open long enough for the editor to
+	// tick, without sleeping for a fixed time.
+	release chan struct{}
+}
+
+func (m *streamingModel) Complete(context.Context, llm.Request) (string, error) {
+	return strings.Join(m.pieces, ""), nil
+}
+
+func (m *streamingModel) Stream(_ context.Context, _ llm.Request, sink llm.Sink) (string, error) {
+	var whole strings.Builder
+	for _, piece := range m.pieces {
+		whole.WriteString(piece)
+		sink(llm.Event{Text: whole.String()})
+		if m.release != nil {
+			<-m.release
+		}
+	}
+	return whole.String(), nil
+}
+
+func TestStreamingShowsTheAnswerBeforeItIsFinished(t *testing.T) {
+	sender := &fakeSender{}
+	release := make(chan struct{})
+	model := &streamingModel{pieces: []string{"Первое ", "второе ", "третье"}, release: release}
+
+	h := New(Options{
+		Sender:        sender,
+		Model:         model,
+		Access:        allowAll,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		BotUsername:   "dr1wbot",
+		MaxConcurrent: 4,
+		MaxReplyRunes: 3500,
+		Timeout:       5 * time.Second,
+		StreamEvery:   time.Millisecond,
+	})
+	h.SetStreaming(true)
+
+	done := make(chan error, 1)
+	go func() { done <- h.HandleGuestMessage(context.Background(), guestMessage("@dr1wbot привет")) }()
+
+	// Let each piece through, giving the editor time to push it into the chat.
+	for range model.pieces {
+		time.Sleep(10 * time.Millisecond)
+		release <- struct{}{}
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("HandleGuestMessage() error = %v", err)
+	}
+
+	_, edits := sender.snapshot()
+	if len(edits) < 2 {
+		t.Fatalf("edits = %+v, want the answer shown while it is written and once at the end", edits)
+	}
+
+	// Everything before the last edit is a partial answer: unformatted, with a
+	// cursor, because half-written Markdown is not valid Markdown.
+	partial := edits[len(edits)-2]
+	if partial.markdown != "" {
+		t.Errorf("partial edit = %+v, want plain text while streaming", partial)
+	}
+	if !strings.HasSuffix(partial.plain, streamCursor) {
+		t.Errorf("partial edit = %q, want a cursor on an unfinished answer", partial.plain)
+	}
+
+	final := edits[len(edits)-1]
+	if final.markdown != "Первое второе третье" {
+		t.Errorf("final edit = %+v, want the finished answer as rich markdown", final)
+	}
+}
+
+func TestStreamingCanBeSwitchedOff(t *testing.T) {
+	sender := &fakeSender{}
+	model := &streamingModel{pieces: []string{"раз ", "два"}}
+
+	h := New(Options{
+		Sender:        sender,
+		Model:         model,
+		Access:        allowAll,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		BotUsername:   "dr1wbot",
+		MaxConcurrent: 4,
+		MaxReplyRunes: 3500,
+		Timeout:       time.Second,
+		StreamEvery:   time.Millisecond,
+	})
+	h.SetStreaming(false)
+
+	if err := h.HandleGuestMessage(context.Background(), guestMessage("@dr1wbot привет")); err != nil {
+		t.Fatalf("HandleGuestMessage() error = %v", err)
+	}
+	_, edits := sender.snapshot()
+	if len(edits) != 1 {
+		t.Fatalf("edits = %+v, want exactly one: the finished answer", edits)
+	}
+	if edits[0].markdown != "раз два" {
+		t.Errorf("edit = %+v, want the whole answer at once", edits[0])
 	}
 }

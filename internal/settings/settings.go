@@ -51,6 +51,14 @@ type Values struct {
 	// CacheTTL is how long an answer to an identical question is reused. Zero
 	// disables the cache.
 	CacheTTL time.Duration `json:"cache_ttl"`
+	// SearchEnabled lets the model look things up on the web. It is a setting
+	// rather than a constant because a search costs a second round trip and a
+	// larger prompt, and an operator watching their quota may want it off.
+	SearchEnabled bool `json:"search_enabled"`
+	// StreamEnabled makes the answer appear as it is written instead of all at
+	// once. It costs one Telegram edit every couple of seconds, which is why it
+	// can be turned off.
+	StreamEnabled bool `json:"stream_enabled"`
 }
 
 // Store keeps Values on disk. It is safe for concurrent use.

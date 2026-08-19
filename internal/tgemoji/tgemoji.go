@@ -48,6 +48,54 @@ const (
 	IDPlaceholder = "5289930378885214069"
 )
 
+// alt is the plain emoji each custom one falls back to. It is a table rather
+// than a literal at every call site because the same icon has to appear in two
+// places that cannot both carry markup: the message body, where the custom
+// emoji renders, and an inline-keyboard label, where Telegram allows no
+// entities at all — a button is plain text by protocol, so the best a button
+// can do is show the same glyph the custom emoji falls back to.
+var alt = map[string]string{
+	IDSettings:    "⚙️",
+	IDProfile:     "👤",
+	IDPeople:      "👥",
+	IDUserOK:      "👤",
+	IDUserNo:      "🚫",
+	IDChart:       "📊",
+	IDGrowth:      "📈",
+	IDLockClosed:  "🔒",
+	IDLockOpen:    "🔓",
+	IDMegaphone:   "📣",
+	IDCheck:       "✅",
+	IDCross:       "❌",
+	IDTrash:       "🗑",
+	IDInfo:        "ℹ️",
+	IDBot:         "🤖",
+	IDEye:         "👁",
+	IDClock:       "⏰",
+	IDElapsed:     "🕓",
+	IDBell:        "🔔",
+	IDCode:        "🔨",
+	IDParty:       "🎉",
+	IDWrite:       "✍️",
+	IDHouse:       "🏘",
+	IDLink:        "🔗",
+	IDCalendar:    "📅",
+	IDPlaceholder: "✍️",
+}
+
+// Alt is the plain emoji that stands for a custom one. Use it wherever markup
+// is impossible — button labels above all — so the panel looks like one design
+// instead of two.
+func Alt(id string) string {
+	if fallback, ok := alt[id]; ok {
+		return fallback
+	}
+	return "•"
+}
+
+// Icon renders a custom emoji by id, taking its fallback from the table.
+func Icon(id string) string { return Tag(id, Alt(id)) }
+
 // PlaceholderAlt is what clients show when the custom placeholder cannot be
 // rendered.
 const PlaceholderAlt = "✍️"

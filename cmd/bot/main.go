@@ -37,6 +37,7 @@ import (
 	"dr1wbot/internal/reply"
 	"dr1wbot/internal/settings"
 	"dr1wbot/internal/tgfile"
+	"dr1wbot/internal/websearch"
 )
 
 // shutdownGrace is how long in-flight answers get to finish after a signal.
@@ -113,6 +114,8 @@ func run() error {
 		PublicMaxRunes:      cfg.PublicMaxRunes,
 		RawFlagEnabled:      cfg.RawSystemPrompt != "",
 		CacheTTL:            cfg.CacheTTL,
+		SearchEnabled:       cfg.SearchEnabled,
+		StreamEnabled:       cfg.StreamEnabled,
 	})
 	if err != nil {
 		return fmt.Errorf("load settings: %w", err)
@@ -167,6 +170,17 @@ func run() error {
 			"note that no Google image model has a free tier, so the key needs billing enabled")
 	}
 
+	// The model is handed a way to look things up, so an answer about this week
+	// is not written from what the training data remembered about last year.
+	// DuckDuckGo needs no key and no account, which is the whole reason it is
+	// the one used here.
+	finder := websearch.New(websearch.Options{
+		MaxResults: cfg.SearchMaxResults,
+		Timeout:    cfg.SearchTimeout,
+		Region:     cfg.SearchRegion,
+		SafeSearch: cfg.SearchSafe,
+	})
+
 	// One client serves both the answers and the admin menu's numbers, so what
 	// the menu shows is what actually happened.
 	model := llm.New(llm.Options{
@@ -178,7 +192,9 @@ func run() error {
 		MaxTokens:       cfg.MaxTokens,
 		ReasoningEffort: cfg.ReasoningEffort,
 		Timeout:         cfg.Timeout,
+		Search:          finder,
 	})
+	model.SetSearchEnabled(live.SearchEnabled)
 
 	handler := reply.New(reply.Options{
 		Sender:          bot,
@@ -190,7 +206,8 @@ func run() error {
 		Files:           tgfile.New(bot, nil),
 		Memory:          memory.New(memory.Options{TTL: cfg.MemoryTTL}),
 		Access:          allow,
-		Commands:        admin.New(allow).WithPardoner(rations),
+		Bans:            rations,
+		Commands:        admin.New(allow).WithBouncer(rations),
 		Logger:          log,
 		BotID:           me.ID,
 		BotUsername:     me.Username,
@@ -202,10 +219,12 @@ func run() error {
 		PublicMaxTokens: live.PublicMaxTokens,
 		PublicMaxRunes:  live.PublicMaxRunes,
 		MaxQueue:        cfg.MaxQueue,
+		StreamEvery:     cfg.StreamEvery,
 		Timeout:         cfg.Timeout,
 		ImageTimeout:    cfg.ImageTimeout,
 	})
 	handler.SetRawFlagEnabled(live.RawFlagEnabled)
+	handler.SetStreaming(live.StreamEnabled)
 
 	panel := menu.New(menu.Options{
 		Sender:   bot,
@@ -221,6 +240,8 @@ func run() error {
 				v.BurstWindow, v.BanFor, v.NewAccountThreshold)
 			handler.SetPublicPolicy(v.PublicMaxTokens, v.PublicMaxRunes)
 			handler.SetRawFlagEnabled(v.RawFlagEnabled)
+			handler.SetStreaming(v.StreamEnabled)
+			model.SetSearchEnabled(v.SearchEnabled)
 			cache.SetTTL(v.CacheTTL)
 		},
 		Logger:      log,
@@ -279,6 +300,8 @@ func run() error {
 		"keys", len(cfg.APIKeys),
 		"guest_mode", me.SupportsGuestQueries,
 		"images", cfg.ImagesEnabled(),
+		"search", live.SearchEnabled,
+		"streaming", live.StreamEnabled,
 		"admins", len(cfg.AdminUsers),
 		"allowed_entries", len(allow.List()),
 		"state_file", cfg.StateFile,

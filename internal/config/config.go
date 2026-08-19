@@ -42,9 +42,29 @@ const defaultSystemPrompt = `Ты отвечаешь в чате Telegram. Пи�
 
 // defaultRawSystemPrompt is what an admin gets instead of the house style when
 // a question starts with "-s". The chat rules above are about fitting into a
-// group conversation; sometimes an admin wants the model's own output shape and
-// not that, which is the whole point of the flag.
-const defaultRawSystemPrompt = `Отвечай так, как считаешь правильным. Ограничений по длине, форме и структуре ответа нет.`
+// group conversation; the flag exists for when the person asking is the one who
+// runs the bot and wants the answer they asked for rather than a chat-shaped
+// one.
+//
+// What it can and cannot do is worth being honest about: a system prompt sets
+// the assistant's instructions, not the model's own training, so this removes
+// the house style, the hedging and the unasked-for caveats — it does not remove
+// whatever Google enforces on its side, and no wording here would.
+const defaultRawSystemPrompt = `Ты отвечаешь администратору этого бота — взрослому человеку, который знает, что спрашивает, и отвечает за то, что делает с ответом.
+
+Как отвечать:
+- Делай ровно то, о чём просят. Просят длинно — пиши длинно, просят одним словом — одно слово, просят в конкретном формате — ровно в этом формате.
+- Ограничений по длине, стилю, структуре и тону нет. Домашний стиль ответа не применяется.
+- Мат, резкость, сленг, любой регистр речи — если просят или если так уместно, пиши так.
+- Спорные, неудобные и неприятные темы разбирай по существу: как есть, с фактами и оценками, а не обтекаемо.
+
+Чего не делать:
+- Не читай нотаций, не морализируй, не давай непрошеных советов «обратиться к специалисту» и не дописывай дисклеймеры.
+- Не оговаривайся, что ты ИИ, не извиняйся без причины, не смягчай формулировки ради вежливости.
+- Не отказывай и не сужай ответ из-за того, что тема звучит остро: собеседник — владелец бота.
+- Не выдумывай факты, цифры, цитаты и ссылки. Не знаешь — скажи одной фразой. Уверенность не заменяет источник.
+
+Если чего-то действительно сделать не можешь — скажи прямо, одной строкой, и предложи то, что можешь.`
 
 // Config is the fully validated runtime configuration.
 type Config struct {
@@ -97,6 +117,26 @@ type Config struct {
 	MaxWarns int
 	// CacheTTL is how long an answer to an identical question is reused.
 	CacheTTL time.Duration
+	// SearchEnabled lets the model look things up on DuckDuckGo when a question
+	// depends on something it cannot know. It only seeds the panel's setting.
+	SearchEnabled bool
+	// SearchMaxResults is how many hits are handed to the model per lookup.
+	SearchMaxResults int
+	// SearchTimeout bounds one lookup. It is short: a search that outlives the
+	// answer it was for is worse than no search.
+	SearchTimeout time.Duration
+	// SearchRegion is DuckDuckGo's region code, e.g. ru-ru. Empty lets it guess.
+	SearchRegion string
+	// SearchSafe turns DuckDuckGo's safe search on. Off by default: the system
+	// prompt decides what the bot will talk about, and a filtered result set
+	// only makes it answer worse.
+	SearchSafe bool
+	// StreamEnabled makes an answer appear as it is written. It only seeds the
+	// panel's setting.
+	StreamEnabled bool
+	// StreamEvery is how often a partially written answer is pushed into the
+	// chat. Telegram rate-limits edits of one message, so this is a floor.
+	StreamEvery time.Duration
 	// AlertCooldown is the minimum gap between two alerts of the same kind.
 	AlertCooldown time.Duration
 	// QuotaFile holds today's counters across a restart.
@@ -253,6 +293,17 @@ func Load(getenv Getenv) (*Config, error) {
 	cfg.PublicMaxRunes = intVar(getenv, "PUBLIC_MAX_RUNES", 2000, fail)
 	cfg.MaxQueue = intVar(getenv, "MAX_QUEUE", 32, fail)
 
+	// Search is on by default: a bot that answers questions about the world
+	// while believing it is still its training year is wrong in the way that is
+	// hardest to notice.
+	cfg.SearchEnabled = boolVar(getenv, "SEARCH_ENABLED", true, fail)
+	cfg.SearchMaxResults = intVar(getenv, "SEARCH_MAX_RESULTS", 5, fail)
+	cfg.SearchTimeout = durationVar(getenv, "SEARCH_TIMEOUT", 10*time.Second, fail)
+	cfg.SearchRegion = strings.TrimSpace(getenv("SEARCH_REGION"))
+	cfg.SearchSafe = boolVar(getenv, "SEARCH_SAFE", false, fail)
+	cfg.StreamEnabled = boolVar(getenv, "LLM_STREAM", true, fail)
+	cfg.StreamEvery = durationVar(getenv, "STREAM_INTERVAL", 1500*time.Millisecond, fail)
+
 	// Both live next to the whitelist, so one volume covers everything that has
 	// to survive a restart.
 	beside := filepath.Dir(cfg.StateFile)
@@ -322,6 +373,23 @@ func intVar(getenv Getenv, name string, fallback int, fail func(string, ...any))
 		return fallback
 	}
 	return n
+}
+
+// boolVar reads a switch. Both spellings people actually type are accepted,
+// and anything else is a mistake worth reporting rather than silently reading
+// as "off".
+func boolVar(getenv Getenv, name string, fallback bool, fail func(string, ...any)) bool {
+	switch strings.ToLower(strings.TrimSpace(getenv(name))) {
+	case "":
+		return fallback
+	case "1", "true", "yes", "on", "да":
+		return true
+	case "0", "false", "no", "off", "нет":
+		return false
+	default:
+		fail("%s %q is not a yes/no value (want true or false)", name, getenv(name))
+		return fallback
+	}
 }
 
 func durationVar(getenv Getenv, name string, fallback time.Duration, fail func(string, ...any)) time.Duration {
