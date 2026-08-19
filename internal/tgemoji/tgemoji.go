@@ -49,11 +49,10 @@ const (
 )
 
 // alt is the plain emoji each custom one falls back to. It is a table rather
-// than a literal at every call site because the same icon has to appear in two
-// places that cannot both carry markup: the message body, where the custom
-// emoji renders, and an inline-keyboard label, where Telegram allows no
-// entities at all — a button is plain text by protocol, so the best a button
-// can do is show the same glyph the custom emoji falls back to.
+// than a literal at every call site because the same icon appears in two
+// places: the message body, as <tg-emoji> markup, and an inline-keyboard
+// button, as icon_custom_emoji_id. Neither is guaranteed to render — a bot may
+// not be allowed custom emoji at all — and both fall back to the same glyph.
 var alt = map[string]string{
 	IDSettings:    "⚙️",
 	IDProfile:     "👤",
@@ -83,9 +82,9 @@ var alt = map[string]string{
 	IDPlaceholder: "✍️",
 }
 
-// Alt is the plain emoji that stands for a custom one. Use it wherever markup
-// is impossible — button labels above all — so the panel looks like one design
-// instead of two.
+// Alt is the plain emoji that stands for a custom one. It is what a rejected
+// message is retried with, in the text and on the buttons alike, so a bot
+// without premium emoji still shows the same panel.
 func Alt(id string) string {
 	if fallback, ok := alt[id]; ok {
 		return fallback

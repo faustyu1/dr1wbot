@@ -582,7 +582,7 @@ func TestBansScreenListsAndUnbans(t *testing.T) {
 	}
 }
 
-func TestButtonLabelsCarryNoMarkup(t *testing.T) {
+func TestButtonsCarryPremiumIcons(t *testing.T) {
 	sender := &fakeSender{}
 	tuner := &fakeTuner{values: settings.Values{PublicDailyLimit: 30, Burst: 5, BurstWindow: time.Minute, BanFor: time.Hour}}
 	h, _ := tunedHandler(t, sender, tuner)
@@ -595,14 +595,95 @@ func TestButtonLabelsCarryNoMarkup(t *testing.T) {
 		if keyboard == nil {
 			t.Fatalf("screen %s has no keyboard", screen)
 		}
+
+		icons := 0
 		for _, row := range keyboard.InlineKeyboard {
 			for _, b := range row {
-				// Telegram allows no entities on a keyboard, so a custom emoji
-				// in a label would be shown as raw HTML.
+				if b.IconCustomEmojiID != "" {
+					icons++
+				}
+				// The icon is a field of its own, not markup in the label:
+				// entities in button text really are impossible, and a label
+				// carrying them would be shown literally.
 				if tgemoji.Has(b.Text) || strings.Contains(b.Text, "<") {
-					t.Errorf("button %q carries markup, which Telegram renders literally", b.Text)
+					t.Errorf("button %q carries markup in its label", b.Text)
+				}
+				// The glyph belongs to the icon, so repeating it in the label
+				// would draw the same emoji twice.
+				if b.IconCustomEmojiID != "" && strings.Contains(b.Text, tgemoji.Alt(b.IconCustomEmojiID)) {
+					t.Errorf("button %q repeats its own icon", b.Text)
 				}
 			}
 		}
+		if icons == 0 {
+			t.Errorf("screen %s has no premium icons on any button", screen)
+		}
+	}
+}
+
+func TestTheStopSwitchIsPainted(t *testing.T) {
+	sender := &fakeSender{}
+	tuner := &fakeTuner{values: settings.Values{PublicDailyLimit: 30}}
+	h, _ := tunedHandler(t, sender, tuner)
+
+	if err := h.HandleCallback(context.Background(), press(adminID, screenSettings)); err != nil {
+		t.Fatalf("HandleCallback() error = %v", err)
+	}
+	stop := sender.edits[len(sender.edits)-1].ReplyMarkup.InlineKeyboard[0][0]
+	if stop.Style != styleDanger {
+		t.Errorf("stop switch style = %q, want %q while the public is served", stop.Style, styleDanger)
+	}
+
+	// Once the public is off, the same button turns them back on.
+	tuner.values.PublicDailyLimit = 0
+	if err := h.HandleCallback(context.Background(), press(adminID, screenSettings)); err != nil {
+		t.Fatalf("HandleCallback() error = %v", err)
+	}
+	stop = sender.edits[len(sender.edits)-1].ReplyMarkup.InlineKeyboard[0][0]
+	if stop.Style != styleSuccess {
+		t.Errorf("stop switch style = %q, want %q once the public is closed", stop.Style, styleSuccess)
+	}
+}
+
+func TestARejectedIconFallsBackToAPlainKeyboard(t *testing.T) {
+	// Premium icons need either a Fragment username or a Premium owner; when
+	// neither holds Telegram refuses the whole request, keyboard included.
+	sender := &fakeSender{failOnce: true}
+	h := newTestHandler(t, sender, nil)
+
+	if _, err := h.HandleMessage(context.Background(), privateMessage(adminID, "/admin")); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if len(sender.sent) != 2 {
+		t.Fatalf("sent %d messages, want the rejected one retried", len(sender.sent))
+	}
+
+	keyboard, ok := sender.sent[1].ReplyMarkup.(*telego.InlineKeyboardMarkup)
+	if !ok {
+		t.Fatalf("retry markup = %T, want an inline keyboard", sender.sent[1].ReplyMarkup)
+	}
+	for _, row := range keyboard.InlineKeyboard {
+		for _, b := range row {
+			if b.IconCustomEmojiID != "" {
+				t.Errorf("button %q still asks for a premium icon on the retry", b.Text)
+			}
+		}
+	}
+	// Nothing is lost but the rendering: the glyph moves into the label.
+	first := keyboard.InlineKeyboard[0][0]
+	if !strings.HasPrefix(first.Text, tgemoji.Alt(tgemoji.IDChart)) {
+		t.Errorf("button = %q, want the icon folded into the label", first.Text)
+	}
+}
+
+func TestPlainKeyboardLeavesAnIconlessButtonAlone(t *testing.T) {
+	keyboard := keys(row(backButton()))
+	plain := plainKeyboard(keyboard)
+
+	if got := plain.InlineKeyboard[0][0].Text; got != "◁ Назад" {
+		t.Errorf("button = %q, want a button with no icon untouched", got)
+	}
+	if hasIcons(plain) {
+		t.Error("hasIcons() = true after folding the icons in")
 	}
 }

@@ -229,8 +229,11 @@ var (
 // manual screen exist at all — otherwise every knob would need its parser
 // written twice and they would drift.
 type knob struct {
-	name  string
-	icon  string // custom-emoji id for the body text
+	name string
+	// icon is the premium emoji, drawn both beside the line in the message body
+	// and on the button itself through icon_custom_emoji_id. The label carries
+	// no emoji of its own, or the same glyph would appear twice.
+	icon  string
 	title string // what the manual prompt calls it
 	hint  string // an example of a value it accepts
 	// label renders the button, current value included.
@@ -246,7 +249,7 @@ var knobs = []knob{{
 	name: knobLimit, icon: tgemoji.IDChart, title: "Лимит на человека в сутки",
 	hint: "число запросов, 0 — выключить публику",
 	label: func(v settings.Values) string {
-		return tgemoji.Alt(tgemoji.IDChart) + " Лимит: " + limitLabel(v.PublicDailyLimit)
+		return "Лимит: " + limitLabel(v.PublicDailyLimit)
 	},
 	cycle: func(v *settings.Values) {
 		v.PublicDailyLimit = settings.Cycle(limitChoices, v.PublicDailyLimit)
@@ -264,7 +267,7 @@ var knobs = []knob{{
 	name: knobGlobal, icon: tgemoji.IDGrowth, title: "Потолок на весь бот в сутки",
 	hint: "число запросов, 0 — без потолка",
 	label: func(v settings.Values) string {
-		return tgemoji.Alt(tgemoji.IDGrowth) + " Всего: " + limitLabel(v.GlobalDailyLimit)
+		return "Всего: " + limitLabel(v.GlobalDailyLimit)
 	},
 	cycle: func(v *settings.Values) { v.GlobalDailyLimit = settings.Cycle(globalChoices, v.GlobalDailyLimit) },
 	parse: number(0, 1000000, func(v *settings.Values, n int) { v.GlobalDailyLimit = n }),
@@ -272,7 +275,7 @@ var knobs = []knob{{
 	name: knobBurst, icon: tgemoji.IDElapsed, title: "Всплеск: сколько запросов подряд ещё по-человечески",
 	hint: "число, например 5",
 	label: func(v settings.Values) string {
-		return tgemoji.Alt(tgemoji.IDElapsed) + " Всплеск: " + strconv.Itoa(v.Burst)
+		return "Всплеск: " + strconv.Itoa(v.Burst)
 	},
 	cycle: func(v *settings.Values) { v.Burst = settings.Cycle(burstChoices, v.Burst) },
 	parse: number(1, 1000, func(v *settings.Values, n int) { v.Burst = n }),
@@ -280,7 +283,7 @@ var knobs = []knob{{
 	name: knobWindow, icon: tgemoji.IDClock, title: "Окно всплеска",
 	hint: "срок, например 1м или 30с",
 	label: func(v settings.Values) string {
-		return tgemoji.Alt(tgemoji.IDClock) + " Окно: " + shortDuration(v.BurstWindow)
+		return "Окно: " + shortDuration(v.BurstWindow)
 	},
 	cycle: func(v *settings.Values) { v.BurstWindow = settings.Cycle(windowChoices, v.BurstWindow) },
 	parse: span(time.Second, 24*time.Hour, func(v *settings.Values, d time.Duration) { v.BurstWindow = d }),
@@ -288,7 +291,7 @@ var knobs = []knob{{
 	name: knobBan, icon: tgemoji.IDCross, title: "Автобан за всплеск",
 	hint: "срок, например 15м, 2ч, 7д",
 	label: func(v settings.Values) string {
-		return tgemoji.Alt(tgemoji.IDCross) + " Автобан: " + shortDuration(v.BanFor)
+		return "Автобан: " + shortDuration(v.BanFor)
 	},
 	cycle: func(v *settings.Values) { v.BanFor = settings.Cycle(banChoices, v.BanFor) },
 	parse: span(time.Minute, 365*24*time.Hour, func(v *settings.Values, d time.Duration) { v.BanFor = d }),
@@ -296,7 +299,7 @@ var knobs = []knob{{
 	name: knobTokens, icon: tgemoji.IDWrite, title: "Токенов на ответ публике",
 	hint: "число, например 1024",
 	label: func(v settings.Values) string {
-		return tgemoji.Alt(tgemoji.IDWrite) + " Токенов: " + strconv.Itoa(v.PublicMaxTokens)
+		return "Токенов: " + strconv.Itoa(v.PublicMaxTokens)
 	},
 	cycle: func(v *settings.Values) { v.PublicMaxTokens = settings.Cycle(tokenChoices, v.PublicMaxTokens) },
 	parse: number(64, 32000, func(v *settings.Values, n int) { v.PublicMaxTokens = n }),
@@ -304,7 +307,7 @@ var knobs = []knob{{
 	name: knobRunes, icon: tgemoji.IDCode, title: "Символов в вопросе от публики",
 	hint: "число, например 2000",
 	label: func(v settings.Values) string {
-		return tgemoji.Alt(tgemoji.IDCode) + " Символов: " + strconv.Itoa(v.PublicMaxRunes)
+		return "Символов: " + strconv.Itoa(v.PublicMaxRunes)
 	},
 	cycle: func(v *settings.Values) { v.PublicMaxRunes = settings.Cycle(promptChoices, v.PublicMaxRunes) },
 	parse: number(50, 100000, func(v *settings.Values, n int) { v.PublicMaxRunes = n }),
@@ -312,7 +315,7 @@ var knobs = []knob{{
 	name: knobNewAcc, icon: tgemoji.IDUserNo, title: "Порог свежего аккаунта",
 	hint: "Telegram id, например 7000000000; 0 — все равны",
 	label: func(v settings.Values) string {
-		return tgemoji.Alt(tgemoji.IDUserNo) + " Новые: " + thresholdLabel(v.NewAccountThreshold)
+		return "Новые: " + thresholdLabel(v.NewAccountThreshold)
 	},
 	cycle: func(v *settings.Values) {
 		v.NewAccountThreshold = settings.Cycle(newAccountChoices, v.NewAccountThreshold)
@@ -322,26 +325,26 @@ var knobs = []knob{{
 	name: knobCache, icon: tgemoji.IDClock, title: "Кэш одинаковых вопросов",
 	hint: "срок, например 10м; 0 — выключить",
 	label: func(v settings.Values) string {
-		return tgemoji.Alt(tgemoji.IDClock) + " Кэш: " + cacheLabel(v.CacheTTL)
+		return "Кэш: " + cacheLabel(v.CacheTTL)
 	},
 	cycle: func(v *settings.Values) { v.CacheTTL = settings.Cycle(cacheChoices, v.CacheTTL) },
 	parse: span(0, 24*time.Hour, func(v *settings.Values, d time.Duration) { v.CacheTTL = d }),
 }, {
 	name: knobSearch, icon: tgemoji.IDLink, title: "Поиск в интернете",
 	label: func(v settings.Values) string {
-		return tgemoji.Alt(tgemoji.IDLink) + " Поиск: " + onOffShort(v.SearchEnabled)
+		return "Поиск: " + onOffShort(v.SearchEnabled)
 	},
 	cycle: func(v *settings.Values) { v.SearchEnabled = !v.SearchEnabled },
 }, {
 	name: knobStream, icon: tgemoji.IDWrite, title: "Ответ по мере написания",
 	label: func(v settings.Values) string {
-		return tgemoji.Alt(tgemoji.IDWrite) + " Стриминг: " + onOffShort(v.StreamEnabled)
+		return "Стриминг: " + onOffShort(v.StreamEnabled)
 	},
 	cycle: func(v *settings.Values) { v.StreamEnabled = !v.StreamEnabled },
 }, {
 	name: knobRaw, icon: tgemoji.IDSettings, title: "Флаг -s для админов",
 	label: func(v settings.Values) string {
-		return tgemoji.Alt(tgemoji.IDSettings) + " Флаг -s: " + onOffShort(v.RawFlagEnabled)
+		return "Флаг -s: " + onOffShort(v.RawFlagEnabled)
 	},
 	cycle: func(v *settings.Values) { v.RawFlagEnabled = !v.RawFlagEnabled },
 }}
@@ -485,7 +488,7 @@ func (h *Handler) HandleMessage(ctx context.Context, msg telego.Message) (handle
 	case "/start", "/help":
 		var keyboard *telego.InlineKeyboardMarkup
 		if h.roster.IsAdmin(userID) {
-			keyboard = keys(row(button("⚙️ Панель", screenMain)))
+			keyboard = keys(row(button(tgemoji.IDSettings, "Панель", screenMain)))
 		}
 		return true, h.send(ctx, msg.Chat.ID, h.greeting(userID), keyboard)
 	case "/admin":
@@ -705,7 +708,7 @@ func (h *Handler) promptScreen(k knob) (string, *telego.InlineKeyboardMarkup) {
 		tgemoji.Icon(tgemoji.IDInfo), shortDuration(askTTL))
 
 	return b.String(), keys(
-		row(button("◁ Отмена", screenManual)),
+		row(button("", "◁ Отмена", screenManual)),
 	)
 }
 
@@ -784,15 +787,17 @@ func (h *Handler) bansScreen() (string, *telego.InlineKeyboardMarkup) {
 				fmt.Fprintf(&b, ", варнов %d", ban.Warns)
 			}
 			fmt.Fprintf(&b, "\n")
-			rows = append(rows, row(action(fmt.Sprintf("%s Разбанить %d", tgemoji.Alt(tgemoji.IDCheck), ban.ID),
-				pardonPrefix+idText(ban.ID))))
+			rows = append(rows, row(styled(
+				action(tgemoji.IDCheck, fmt.Sprintf("Разбанить %d", ban.ID), pardonPrefix+idText(ban.ID)),
+				styleSuccess)))
 		default:
 			// A ban placed on a name nobody has spoken under yet: there is no id
 			// to pardon, so the name itself travels in the callback data.
 			fmt.Fprintf(&b, "%s @%s — <b>%s</b>, ждёт первого сообщения\n",
 				tgemoji.Icon(tgemoji.IDUserNo), escape(ban.Username), when)
-			rows = append(rows, row(action(fmt.Sprintf("%s Разбанить @%s", tgemoji.Alt(tgemoji.IDCheck), ban.Username),
-				unnamePrefix+ban.Username)))
+			rows = append(rows, row(styled(
+				action(tgemoji.IDCheck, "Разбанить @"+ban.Username, unnamePrefix+ban.Username),
+				styleSuccess)))
 		}
 	}
 
@@ -839,17 +844,13 @@ func (h *Handler) mainScreen() (string, *telego.InlineKeyboardMarkup) {
 	fmt.Fprintf(&b, "%s Ответов за сессию: <b>%d</b>\n", tgemoji.Tag(tgemoji.IDGrowth, "📈"), answered(stats))
 	fmt.Fprintf(&b, "%s Аптайм: <b>%s</b>", tgemoji.Tag(tgemoji.IDClock, "⏰"), shortDuration(time.Since(h.startedAt)))
 
-	// Button labels are plain text by protocol: Telegram allows no entities on a
-	// keyboard, so the custom emoji of the message body cannot appear here. The
-	// same glyphs they fall back to are used instead, which is as close as the
-	// API permits.
 	return b.String(), keys(
-		row(button(tgemoji.Alt(tgemoji.IDChart)+" Лимиты", screenLimits),
-			button(tgemoji.Alt(tgemoji.IDGrowth)+" Статистика", screenStats)),
-		row(button(tgemoji.Alt(tgemoji.IDPeople)+" Доступ", screenPeople),
-			button(tgemoji.Alt(tgemoji.IDSettings)+" Настройки", screenSettings)),
-		row(button(tgemoji.Alt(tgemoji.IDUserNo)+" Баны", screenBans),
-			button(tgemoji.Alt(tgemoji.IDInfo)+" Справка", screenHelp)),
+		row(button(tgemoji.IDChart, "Лимиты", screenLimits),
+			button(tgemoji.IDGrowth, "Статистика", screenStats)),
+		row(button(tgemoji.IDPeople, "Доступ", screenPeople),
+			button(tgemoji.IDSettings, "Настройки", screenSettings)),
+		row(button(tgemoji.IDUserNo, "Баны", screenBans),
+			button(tgemoji.IDInfo, "Справка", screenHelp)),
 	)
 }
 
@@ -888,7 +889,7 @@ func (h *Handler) limitsScreen() (string, *telego.InlineKeyboardMarkup) {
 		tgemoji.Tag(tgemoji.IDInfo, "ℹ️"))
 
 	return b.String(), keys(
-		row(button(tgemoji.Alt(tgemoji.IDEye)+" Проверить ключи", screenCheck)),
+		row(button(tgemoji.IDEye, "Проверить ключи", screenCheck)),
 		row(backButton()),
 	)
 }
@@ -926,7 +927,7 @@ func (h *Handler) checkScreen(ctx context.Context) (string, *telego.InlineKeyboa
 		tgemoji.Tag(tgemoji.IDInfo, "ℹ️"))
 
 	return b.String(), keys(
-		row(button("🔄 Ещё раз", screenCheck)),
+		row(button(tgemoji.IDEye, "Ещё раз", screenCheck)),
 		row(backButton()),
 	)
 }
@@ -1054,10 +1055,10 @@ func (h *Handler) settingsScreen() (string, *telego.InlineKeyboardMarkup) {
 		"и переживают перезапуск: с этого момента <code>.env</code> для них уже не читается.</i>",
 		tgemoji.Icon(tgemoji.IDInfo))
 
-	rows := [][]telego.InlineKeyboardButton{row(action(killLabel(v.PublicDailyLimit), killPublic))}
+	rows := [][]telego.InlineKeyboardButton{row(killButton(v.PublicDailyLimit))}
 	rows = append(rows, pairs(v)...)
 	rows = append(rows,
-		row(button(tgemoji.Alt(tgemoji.IDWrite)+" Ввести вручную", screenManual)),
+		row(button(tgemoji.IDWrite, "Ввести вручную", screenManual)),
 		row(backButton()))
 	return b.String(), keys(rows...)
 }
@@ -1067,10 +1068,12 @@ func pairs(v settings.Values) [][]telego.InlineKeyboardButton {
 	rows := make([][]telego.InlineKeyboardButton, 0, (len(knobs)+1)/2)
 	for i := 0; i < len(knobs); i += 2 {
 		if i+1 == len(knobs) {
-			rows = append(rows, row(edit(knobs[i].label(v), knobs[i].name)))
+			rows = append(rows, row(edit(knobs[i].icon, knobs[i].label(v), knobs[i].name)))
 			continue
 		}
-		rows = append(rows, row(edit(knobs[i].label(v), knobs[i].name), edit(knobs[i+1].label(v), knobs[i+1].name)))
+		rows = append(rows, row(
+			edit(knobs[i].icon, knobs[i].label(v), knobs[i].name),
+			edit(knobs[i+1].icon, knobs[i+1].label(v), knobs[i+1].name)))
 	}
 	return rows
 }
@@ -1096,13 +1099,13 @@ func (h *Handler) manualScreen() (string, *telego.InlineKeyboardMarkup) {
 			continue // a switch has nothing to type
 		}
 		fmt.Fprintf(&b, "%s <b>%s</b> — сейчас <b>%s</b>\n", tgemoji.Icon(k.icon), escape(k.title), escape(valueOf(k, v)))
-		rows = append(rows, row(action(k.label(v), askPrefix+k.name)))
+		rows = append(rows, row(action(k.icon, k.label(v), askPrefix+k.name)))
 	}
 
 	fmt.Fprintf(&b, "\n%s <i>Сроки пишутся как <code>30с</code>, <code>15м</code>, <code>2ч</code>, "+
 		"<code>7д</code>; голое число — минуты.</i>", tgemoji.Icon(tgemoji.IDInfo))
 
-	rows = append(rows, row(button("◁ К настройкам", screenSettings)), row(backButton()))
+	rows = append(rows, row(button("", "◁ К настройкам", screenSettings)), row(backButton()))
 	return b.String(), keys(rows...)
 }
 
@@ -1113,14 +1116,16 @@ func limitLabel(n int) string {
 	return strconv.Itoa(n)
 }
 
-// killLabel names the stop switch after what pressing it does, not after what
-// the current state is — a button that says "включено" is ambiguous about
-// whether that is a description or a promise.
-func killLabel(limit int) string {
+// killButton is the stop switch, named after what pressing it does rather than
+// after the current state — a button that says "включено" is ambiguous about
+// whether that is a description or a promise. It is the one button that is
+// painted: closing the bot to the public is the press an operator hunts for
+// while watching abuse happen.
+func killButton(limit int) telego.InlineKeyboardButton {
 	if limit > 0 {
-		return "🛑 Выключить публику"
+		return styled(action(tgemoji.IDLockClosed, "Выключить публику", killPublic), styleDanger)
 	}
-	return tgemoji.Alt(tgemoji.IDMegaphone) + " Включить публику"
+	return styled(action(tgemoji.IDMegaphone, "Включить публику", killPublic), styleSuccess)
 }
 
 func thresholdLabel(n int64) string {
@@ -1182,14 +1187,24 @@ func (h *Handler) send(ctx context.Context, chatID int64, text string, keyboard 
 		params.ReplyMarkup = keyboard
 	}
 	_, err := h.sender.SendMessage(ctx, params)
-	if err == nil || !tgemoji.Has(text) {
+	if err == nil || !fancy(text, keyboard) {
 		return err
 	}
 
 	h.log.Warn("menu rejected with custom emoji, retrying plain", "err", err)
 	params.Text = tgemoji.Strip(text)
+	if keyboard != nil {
+		params.ReplyMarkup = plainKeyboard(keyboard)
+	}
 	_, plainErr := h.sender.SendMessage(ctx, params)
 	return plainErr
+}
+
+// fancy reports whether a screen asks for anything premium — custom emoji in
+// the text, an icon on a button — and is therefore worth a second, plain
+// attempt when Telegram refuses it.
+func fancy(text string, keyboard *telego.InlineKeyboardMarkup) bool {
+	return tgemoji.Has(text) || hasIcons(keyboard)
 }
 
 // edit swaps a menu message for another screen, with the same fallback.
@@ -1203,12 +1218,13 @@ func (h *Handler) edit(ctx context.Context, chatID int64, messageID int, text st
 		LinkPreviewOptions: &telego.LinkPreviewOptions{IsDisabled: true},
 	}
 	_, err := h.sender.EditMessageText(ctx, params)
-	if err == nil || !tgemoji.Has(text) {
+	if err == nil || !fancy(text, keyboard) {
 		return err
 	}
 
 	h.log.Warn("menu edit rejected with custom emoji, retrying plain", "err", err)
 	params.Text = tgemoji.Strip(text)
+	params.ReplyMarkup = plainKeyboard(keyboard)
 	_, plainErr := h.sender.EditMessageText(ctx, params)
 	return plainErr
 }
@@ -1278,26 +1294,89 @@ func shortDuration(d time.Duration) string {
 	}
 }
 
-// button builds one menu button. Button labels are plain text — Telegram allows
-// no entities there, so custom emoji stay in the message body.
-func button(label, screen string) telego.InlineKeyboardButton {
-	return telego.InlineKeyboardButton{Text: label, CallbackData: callbackPrefix + screen}
+// Button styles Telegram renders itself. Unlike the icon, these carry no
+// premium condition: an omitted style is simply the app's default.
+const (
+	styleDanger  = "danger"  // red: closes something, cuts somebody off
+	styleSuccess = "success" // green: lets somebody back in
+)
+
+// button builds one menu button.
+//
+// The icon is a real premium emoji: inline-keyboard buttons carry
+// icon_custom_emoji_id, which Telegram draws before the label. It is not an
+// entity inside the text — the label itself stays plain — and it works in two
+// cases: for bots that bought a username on Fragment, and in messages the bot
+// sends directly to a private, group or supergroup chat when the bot's owner
+// has Premium. The panel is the second case. When neither holds, Telegram
+// refuses the whole request, which is what plainKeyboard is for.
+func button(icon, label, screen string) telego.InlineKeyboardButton {
+	return telego.InlineKeyboardButton{
+		Text:              label,
+		IconCustomEmojiID: icon,
+		CallbackData:      callbackPrefix + screen,
+	}
 }
 
 // action builds a button that does something to somebody instead of opening a
 // screen. The target id travels in the callback data, which is what makes a ban
 // button possible without a text field.
-func action(label, data string) telego.InlineKeyboardButton {
-	return button(label, data)
+func action(icon, label, data string) telego.InlineKeyboardButton {
+	return button(icon, label, data)
+}
+
+// styled paints a button, for the two presses worth marking: the one that cuts
+// people off and the one that lets somebody back in.
+func styled(b telego.InlineKeyboardButton, style string) telego.InlineKeyboardButton {
+	b.Style = style
+	return b
 }
 
 // edit builds a button that changes a setting instead of opening a screen.
-func edit(label, knob string) telego.InlineKeyboardButton {
-	return button(label, editPrefix+knob)
+func edit(icon, label, knob string) telego.InlineKeyboardButton {
+	return button(icon, label, editPrefix+knob)
 }
 
 func backButton() telego.InlineKeyboardButton {
-	return button("◁ Назад", screenMain)
+	return button("", "◁ Назад", screenMain)
+}
+
+// plainKeyboard is the same keyboard for a bot that may not use premium icons:
+// each icon is folded into its label as the plain emoji it falls back to, so
+// nothing is lost but the rendering.
+func plainKeyboard(keyboard *telego.InlineKeyboardMarkup) *telego.InlineKeyboardMarkup {
+	if keyboard == nil {
+		return nil
+	}
+	rows := make([][]telego.InlineKeyboardButton, 0, len(keyboard.InlineKeyboard))
+	for _, source := range keyboard.InlineKeyboard {
+		row := make([]telego.InlineKeyboardButton, 0, len(source))
+		for _, b := range source {
+			if b.IconCustomEmojiID != "" {
+				b.Text = tgemoji.Alt(b.IconCustomEmojiID) + " " + b.Text
+				b.IconCustomEmojiID = ""
+			}
+			row = append(row, b)
+		}
+		rows = append(rows, row)
+	}
+	return &telego.InlineKeyboardMarkup{InlineKeyboard: rows}
+}
+
+// hasIcons reports whether any button asks for a premium icon, which is what
+// makes a rejected message worth retrying.
+func hasIcons(keyboard *telego.InlineKeyboardMarkup) bool {
+	if keyboard == nil {
+		return false
+	}
+	for _, row := range keyboard.InlineKeyboard {
+		for _, b := range row {
+			if b.IconCustomEmojiID != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func row(buttons ...telego.InlineKeyboardButton) []telego.InlineKeyboardButton {
