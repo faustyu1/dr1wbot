@@ -212,6 +212,7 @@ type Handler struct {
 	storageChatID   int64
 	maxReplyRunes   int
 	timeout         time.Duration
+	totalTimeout    time.Duration
 	imageTimeout    time.Duration
 	commandReplyTTL time.Duration
 	rawSystemPrompt string
@@ -242,8 +243,14 @@ type Options struct {
 	StorageChatID int64
 	MaxConcurrent int
 	MaxReplyRunes int
-	Timeout       time.Duration
-	ImageTimeout  time.Duration
+	// Timeout bounds one model attempt, and doubles as how long a summon may
+	// wait for a free worker.
+	Timeout time.Duration
+	// TotalTimeout is the whole budget a question may spend on the model,
+	// across every key and model the client tries. Zero keeps it at Timeout,
+	// which leaves the first attempt as the only one.
+	TotalTimeout time.Duration
+	ImageTimeout time.Duration
 	// CommandReplyTTL is how long the answer to /add, /del or /list stays in
 	// full before it is shrunk to a marker. Zero leaves it standing.
 	CommandReplyTTL time.Duration
@@ -272,6 +279,9 @@ func New(opts Options) *Handler {
 	}
 	if opts.ImageTimeout <= 0 {
 		opts.ImageTimeout = 2 * time.Minute
+	}
+	if opts.TotalTimeout < opts.Timeout {
+		opts.TotalTimeout = opts.Timeout
 	}
 	if opts.StreamEvery <= 0 {
 		opts.StreamEvery = defaultStreamEvery
@@ -302,6 +312,7 @@ func New(opts Options) *Handler {
 		storageChatID: opts.StorageChatID,
 		maxReplyRunes: opts.MaxReplyRunes,
 		timeout:       opts.Timeout,
+		totalTimeout:  opts.TotalTimeout,
 		imageTimeout:  opts.ImageTimeout,
 
 		commandReplyTTL: opts.CommandReplyTTL,
@@ -516,7 +527,7 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 	}
 	defer release()
 
-	llmCtx, cancel := context.WithTimeout(ctx, h.timeout)
+	llmCtx, cancel := context.WithTimeout(ctx, h.totalTimeout)
 	defer cancel()
 
 	system := ""
@@ -723,7 +734,7 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 	}
 	defer release()
 
-	llmCtx, cancel := context.WithTimeout(ctx, h.timeout)
+	llmCtx, cancel := context.WithTimeout(ctx, h.totalTimeout)
 	defer cancel()
 
 	system := ""

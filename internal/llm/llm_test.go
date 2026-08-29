@@ -883,3 +883,179 @@ func TestToolRoundsAreBounded(t *testing.T) {
 		t.Errorf("rounds = %d, want the loop cut off after %d searches", rounds, maxToolRounds)
 	}
 }
+
+// hangingFor answers every key but the named one, which it leaves waiting on
+// release. It is the shape of the failure this client exists to survive: the
+// backend accepts the connection and then says nothing. Like the deadline test
+// above, the handler has to outlive the client but still return, or httptest's
+// Close would block on it.
+func hangingFor(t *testing.T, stalled string, release <-chan struct{}) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer "+stalled {
+			<-release
+			return
+		}
+		writeAnswer(t, w, "ответ")
+	}
+}
+
+// hangingServer wires hangingFor to a server whose stalled handler is released
+// before the server itself is closed.
+func hangingServer(t *testing.T, stalled string) *httptest.Server {
+	t.Helper()
+	release := make(chan struct{})
+	server := httptest.NewServer(hangingFor(t, stalled, release))
+	// Cleanups run last-registered-first, so the release happens first.
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
+	return server
+}
+
+func TestStalledAttemptMovesToTheNextKey(t *testing.T) {
+	server := hangingServer(t, "one")
+
+	client := New(Options{
+		BaseURL:        server.URL,
+		APIKeys:        []string{"one", "two"},
+		Models:         []string{"test-model"},
+		AttemptTimeout: 50 * time.Millisecond,
+		Timeout:        5 * time.Second,
+	})
+
+	got, err := client.Complete(context.Background(), Request{Prompt: "вопрос"})
+	if err != nil {
+		t.Fatalf("Complete() error = %v, want the second key to answer", err)
+	}
+	if got != "ответ" {
+		t.Errorf("Complete() = %q, want the second key's answer", got)
+	}
+	// A stall says something about the backend, not about the quota, so the key
+	// that hung must still be spendable.
+	if parked := client.keys.Stats().Parked; parked != 0 {
+		t.Errorf("parked keys = %d, want a stall to park nothing", parked)
+	}
+}
+
+func TestStalledAttemptIsBoundedByAttemptTimeoutNotTheWholeBudget(t *testing.T) {
+	server := hangingServer(t, "one")
+
+	client := New(Options{
+		BaseURL:        server.URL,
+		APIKeys:        []string{"one", "two"},
+		Models:         []string{"test-model"},
+		AttemptTimeout: 50 * time.Millisecond,
+		Timeout:        5 * time.Second,
+	})
+
+	// The whole budget is far larger than one attempt; without a per-attempt
+	// bound the first key would spend all of it and the second would never run.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	if _, err := client.Complete(ctx, Request{Prompt: "вопрос"}); err != nil {
+		t.Fatalf("Complete() error = %v", err)
+	}
+	if took := time.Since(started); took > time.Second {
+		t.Errorf("Complete() took %v, want the stalled attempt cut short", took)
+	}
+}
+
+func TestUnreachableBackendTriesTheNextKey(t *testing.T) {
+	// The first key's connection is accepted and then dropped, which is a
+	// transport error rather than any status the provider chose to send.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer one" {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("Hijack() error = %v", err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		writeAnswer(t, w, "ответ")
+	}))
+	t.Cleanup(server.Close)
+
+	client := New(Options{
+		BaseURL: server.URL,
+		APIKeys: []string{"one", "two"},
+		Models:  []string{"test-model"},
+		Timeout: 5 * time.Second,
+	})
+
+	got, err := client.Complete(context.Background(), Request{Prompt: "вопрос"})
+	if err != nil {
+		t.Fatalf("Complete() error = %v, want the second key to answer", err)
+	}
+	if got != "ответ" {
+		t.Errorf("Complete() = %q, want the second key's answer", got)
+	}
+}
+
+func TestStreamOutlivesTheAttemptTimeoutWhileItKeepsArriving(t *testing.T) {
+	const (
+		chunks   = 6
+		gap      = 40 * time.Millisecond
+		attempts = 100 * time.Millisecond
+	)
+
+	client := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("ResponseWriter cannot flush, so nothing can be streamed")
+			return
+		}
+		for range chunks {
+			if _, err := io.WriteString(w, `data: {"choices":[{"delta":{"content":"я"}}]}`+"\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+			time.Sleep(gap)
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	})
+	client.attemptTimeout = attempts
+
+	// The answer takes longer than an attempt is allowed to be silent for, but
+	// never goes quiet for that long: a slow answer is not a stalled one, and
+	// cutting it off to start again on another key would only make it slower.
+	answer, err := client.Stream(context.Background(), Request{Prompt: "вопрос"}, func(Event) {})
+	if err != nil {
+		t.Fatalf("Stream() error = %v, want the fragments to keep the attempt alive", err)
+	}
+	if want := strings.Repeat("я", chunks); answer != want {
+		t.Errorf("Stream() = %q, want %q", answer, want)
+	}
+}
+
+func TestRoomForAttempt(t *testing.T) {
+	client := &Client{attemptTimeout: time.Second}
+
+	if !client.roomForAttempt(context.Background()) {
+		t.Error("roomForAttempt() = false for a context with no deadline, want true")
+	}
+
+	spent, cancel := context.WithCancel(context.Background())
+	cancel()
+	if client.roomForAttempt(spent) {
+		t.Error("roomForAttempt() = true for a cancelled context, want false")
+	}
+
+	// A sliver of budget buys an attempt that cannot finish; the error already
+	// in hand explains more than its deadline would.
+	sliver, cancelSliver := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelSliver()
+	if client.roomForAttempt(sliver) {
+		t.Error("roomForAttempt() = true with a tenth of an attempt left, want false")
+	}
+
+	roomy, cancelRoomy := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelRoomy()
+	if !client.roomForAttempt(roomy) {
+		t.Error("roomForAttempt() = false with two attempts left, want true")
+	}
+}
