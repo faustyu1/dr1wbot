@@ -84,7 +84,14 @@ type Config struct {
 	RawSystemPrompt string
 	MaxTokens       int
 	ReasoningEffort string
-	Timeout         time.Duration
+	// Timeout bounds one attempt: one model on one key. A streaming attempt
+	// spends it on silence rather than on length, so a long answer that keeps
+	// arriving is never cut off.
+	Timeout time.Duration
+	// TotalTimeout bounds the whole question across every attempt. It is what
+	// lets a stalled first attempt cost a retry instead of the answer, so it
+	// only earns its keep above Timeout.
+	TotalTimeout time.Duration
 
 	AdminUsers   map[int64]struct{}
 	AllowedUsers map[int64]struct{}
@@ -244,6 +251,14 @@ func Load(getenv Getenv) (*Config, error) {
 	cfg.MaxTokens = intVar(getenv, "LLM_MAX_TOKENS", 4096, fail)
 	cfg.KeyCooldown = durationVar(getenv, "LLM_KEY_COOLDOWN", time.Minute, fail)
 	cfg.Timeout = durationVar(getenv, "LLM_TIMEOUT", 30*time.Second, fail)
+	// Two attempts by default: one stalled backend is the common case, and a
+	// third attempt buys less than the wait it adds for whoever asked.
+	cfg.TotalTimeout = durationVar(getenv, "LLM_TOTAL_TIMEOUT", 2*cfg.Timeout, fail)
+	if cfg.TotalTimeout < cfg.Timeout {
+		// A total below one attempt would cut the first attempt short and leave
+		// no room for a second, which is worse than either bound alone.
+		cfg.TotalTimeout = cfg.Timeout
+	}
 	cfg.MaxConcurrent = intVar(getenv, "MAX_CONCURRENT", 8, fail)
 	cfg.MaxReplyRunes = intVar(getenv, "MAX_REPLY_RUNES", 3500, fail)
 

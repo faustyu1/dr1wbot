@@ -191,8 +191,11 @@ func run() error {
 		SystemPrompt:    cfg.SystemPrompt,
 		MaxTokens:       cfg.MaxTokens,
 		ReasoningEffort: cfg.ReasoningEffort,
-		Timeout:         cfg.Timeout,
-		Search:          finder,
+		AttemptTimeout:  cfg.Timeout,
+		// The HTTP client's own bound is the backstop for the whole question;
+		// each attempt is cut short by its watchdog long before this.
+		Timeout: cfg.TotalTimeout,
+		Search:  finder,
 	})
 	model.SetSearchEnabled(live.SearchEnabled)
 
@@ -221,6 +224,7 @@ func run() error {
 		MaxQueue:        cfg.MaxQueue,
 		StreamEvery:     cfg.StreamEvery,
 		Timeout:         cfg.Timeout,
+		TotalTimeout:    cfg.TotalTimeout,
 		ImageTimeout:    cfg.ImageTimeout,
 	})
 	handler.SetRawFlagEnabled(live.RawFlagEnabled)

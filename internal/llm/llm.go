@@ -38,6 +38,12 @@ var ErrRateLimited = errors.New("rate limited")
 // ErrRateLimited.
 var errOverloaded = errors.New("provider temporarily unavailable")
 
+// errStalled marks an attempt that went quiet: the connection never came up, or
+// nothing arrived for a whole AttemptTimeout while the request still had time
+// left. Nothing about the request or the key is wrong, so the fix is another
+// attempt rather than a failure.
+var errStalled = errors.New("attempt stalled")
+
 // Turn is one earlier message in the conversation.
 type Turn struct {
 	Role    string // "user" or "assistant"
@@ -99,6 +105,7 @@ type Client struct {
 	maxTokens       int
 	reasoningEffort string
 	search          Searcher
+	attemptTimeout  time.Duration
 	now             func() time.Time
 
 	// knobs the admin panel flips while requests are in flight.
@@ -130,7 +137,14 @@ type Options struct {
 	// provider. Thinking tokens are billed against MaxTokens, so a low effort is
 	// what keeps a chat-sized budget from being spent before the answer starts.
 	ReasoningEffort string
-	Timeout         time.Duration
+	// AttemptTimeout bounds the silence in one attempt — one model on one key.
+	// It is a bound on going quiet rather than on length: a streamed answer
+	// that keeps arriving is working however long it runs. Without it the first
+	// attempt that stalls spends the caller's whole budget and the other keys
+	// are never reached. Zero leaves the attempts sharing the caller's context.
+	AttemptTimeout time.Duration
+	// Timeout bounds the whole request across every attempt.
+	Timeout time.Duration
 	// Search gives the model a way to look things up. Nil switches the tool off
 	// entirely, which is not the same as SetSearchEnabled(false): that one is
 	// reversible from the panel.
@@ -161,6 +175,7 @@ func New(opts Options) *Client {
 		maxTokens:       opts.MaxTokens,
 		reasoningEffort: opts.ReasoningEffort,
 		search:          opts.Search,
+		attemptTimeout:  opts.AttemptTimeout,
 		now:             opts.Now,
 		answers:         make(map[string]int),
 	}
@@ -585,7 +600,11 @@ func (c *Client) round(ctx context.Context, messages []message, tools []tool, ma
 		}
 
 		for _, lease := range c.keys.Lease() {
-			answer, err := c.call(ctx, model, lease.Key, payload, sink)
+			if !c.roomForAttempt(ctx) {
+				c.recordFailure(false)
+				return reply{}, outOfTime(ctx, lastErr)
+			}
+			answer, err := c.attempt(ctx, model, lease.Key, payload, sink)
 			if err == nil {
 				c.keys.Works(lease.Index)
 				// A tool round is not an answer: counting it would report two
@@ -601,8 +620,9 @@ func (c *Client) round(ctx context.Context, messages []message, tools []tool, ma
 			case errors.Is(err, ErrRateLimited):
 				c.keys.Limit(lease.Index)
 				quotaHit = true
-			case errors.Is(err, errOverloaded):
+			case errors.Is(err, errOverloaded), errors.Is(err, errStalled):
 				// Another key may land on a healthier backend; nothing to park.
+				// A stall says something about the backend, not about the key.
 			default:
 				c.recordFailure(false)
 				return reply{}, err // a broken request stays broken on every key
@@ -619,6 +639,68 @@ func (c *Client) round(ctx context.Context, messages []message, tools []tool, ma
 		return reply{}, errors.Join(ErrRateLimited, lastErr)
 	}
 	return reply{}, lastErr
+}
+
+// attempt runs one call under its own watchdog. A backend that accepts the
+// connection and then goes quiet is the common failure here, and without a
+// per-attempt bound the first such attempt spends the whole request's budget —
+// every other key and model is then skipped for want of time.
+func (c *Client) attempt(ctx context.Context, model, apiKey string, payload []byte, sink Sink) (reply, error) {
+	if c.attemptTimeout <= 0 {
+		return c.call(ctx, model, apiKey, payload, sink)
+	}
+
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	watchdog := time.AfterFunc(c.attemptTimeout, cancel)
+	defer watchdog.Stop()
+
+	// Every streamed fragment is proof the backend is still working, so it buys
+	// the attempt another full timeout. A long answer is not a stalled one, and
+	// cutting it off to start again on another key would only make it longer.
+	watched := sink
+	if sink != nil {
+		watched = func(event Event) {
+			watchdog.Reset(c.attemptTimeout)
+			sink(event)
+		}
+	}
+
+	answer, err := c.call(attemptCtx, model, apiKey, payload, watched)
+	if err != nil && attemptCtx.Err() != nil && ctx.Err() == nil {
+		// This attempt went quiet while the request still has time, which is
+		// the case worth another key rather than an apology.
+		return reply{}, errors.Join(errStalled, err)
+	}
+	return answer, err
+}
+
+// roomForAttempt reports whether enough of the request's budget is left to be
+// worth another attempt. A sliver of time buys a call that cannot finish, and
+// its deadline error would only bury the one already in hand.
+func (c *Client) roomForAttempt(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || c.attemptTimeout <= 0 {
+		return true
+	}
+	return time.Until(deadline) >= c.attemptTimeout/4
+}
+
+// outOfTime explains a request that stopped for want of budget. There is
+// normally a failed attempt to report; the context's own error is the fallback
+// for a caller that arrived with nothing left to spend.
+func outOfTime(ctx context.Context, lastErr error) error {
+	if lastErr != nil {
+		return lastErr
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("no time left for an attempt: %w", err)
+	}
+	return fmt.Errorf("no time left for an attempt")
 }
 
 // emptyAnswer explains a response that carried no text.
@@ -708,7 +790,9 @@ func (c *Client) call(ctx context.Context, model, apiKey string, payload []byte,
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		return reply{}, fmt.Errorf("call %s: %w", c.baseURL, err)
+		// A connection that never came up says nothing about the key or the
+		// request, so the next attempt is worth making.
+		return reply{}, errors.Join(errStalled, fmt.Errorf("call %s: %w", c.baseURL, err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
