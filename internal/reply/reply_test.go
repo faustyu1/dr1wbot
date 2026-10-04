@@ -605,8 +605,68 @@ func TestAFailedAnswerKeepsThePreviousThread(t *testing.T) {
 
 	// The failed summon never became a conversation, so the earlier one is still
 	// there for whoever replies to it.
-	if len(store.History(-100500)) == 0 {
+	if len(store.Thread(-100500, "ответ")) == 0 {
 		t.Error("history was dropped by a summon that never got an answer")
+	}
+}
+
+func TestReplyToAnOlderAnswerContinuesItsOwnThread(t *testing.T) {
+	sender := &fakeSender{}
+	model := &fakeModel{answer: "CAP — это теорема"}
+	store := memory.New(memory.Options{})
+	h := newHandler(sender, model, handlerOpts{memory: store})
+
+	if err := h.HandleGuestMessage(context.Background(), guestMessage("@dr1wbot что такое CAP")); err != nil {
+		t.Fatalf("HandleGuestMessage() error = %v", err)
+	}
+	model.answer = "Четыре"
+	if err := h.HandleGuestMessage(context.Background(), guestMessage("@dr1wbot сколько будет 2+2")); err != nil {
+		t.Fatalf("HandleGuestMessage() error = %v", err)
+	}
+
+	// Somebody else replies to the first answer, after another topic came up.
+	msg := guestMessage("@dr1wbot а подробнее?")
+	msg.From = &telego.User{ID: 222, FirstName: "Вася"}
+	msg.ReplyToMessage = ownAnswer("CAP — это теорема")
+	if err := h.HandleGuestMessage(context.Background(), msg); err != nil {
+		t.Fatalf("HandleGuestMessage() error = %v", err)
+	}
+
+	joined := ""
+	for _, turn := range model.lastHistory(t) {
+		joined += turn.Content + "\n"
+	}
+	if !strings.Contains(joined, "что такое CAP") {
+		t.Errorf("history = %q, want the thread of the answer that was replied to", joined)
+	}
+	if strings.Contains(joined, "2+2") {
+		t.Errorf("history = %q, want nothing from the later, unrelated topic", joined)
+	}
+}
+
+func TestDirectReplyToAnOlderAnswerContinuesItsOwnThread(t *testing.T) {
+	sender := &fakeSender{}
+	model := &fakeModel{answer: "CAP — это теорема"}
+	store := memory.New(memory.Options{})
+	h := newHandler(sender, model, handlerOpts{memory: store})
+
+	if err := h.HandleDirectMessage(context.Background(), directMessage(111, "что такое CAP")); err != nil {
+		t.Fatalf("HandleDirectMessage() error = %v", err)
+	}
+	model.answer = "Четыре"
+	if err := h.HandleDirectMessage(context.Background(), directMessage(111, "сколько будет 2+2")); err != nil {
+		t.Fatalf("HandleDirectMessage() error = %v", err)
+	}
+
+	msg := directMessage(111, "а подробнее?")
+	msg.ReplyToMessage = ownAnswer("CAP — это теорема")
+	if err := h.HandleDirectMessage(context.Background(), msg); err != nil {
+		t.Fatalf("HandleDirectMessage() error = %v", err)
+	}
+
+	history := model.lastHistory(t)
+	if len(history) != 2 || history[0].Content != "что такое CAP" {
+		t.Errorf("history = %+v, want only the thread of the answer that was replied to", history)
 	}
 }
 

@@ -62,11 +62,12 @@ type Downloader interface {
 	Download(ctx context.Context, fileID string) ([]byte, error)
 }
 
-// Remembrancer keeps the short conversation history guest mode does not give us.
+// Remembrancer keeps the short conversation history guest mode does not give us,
+// one thread per answer, so a reply continues the chain it points at.
 type Remembrancer interface {
-	History(chatID int64) []memory.Turn
-	Remember(chatID int64, question, answer string)
-	Forget(chatID int64)
+	Thread(chatID int64, answer string) []memory.Turn
+	Latest(chatID int64) []memory.Turn
+	Remember(chatID int64, history []memory.Turn, question, answer string)
 }
 
 // Rationer meters people who are not on the whitelist. A nil one keeps the bot
@@ -492,9 +493,30 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 	question, raw := h.rawRequested(question, userID)
 	maxTokens, maxRunes := h.publicCaps()
 
+	// A private chat is a real conversation, so a plain message continues the
+	// latest thread. A reply to one of our earlier answers continues that
+	// answer's thread instead: replying is how you say which part of the
+	// conversation you mean.
+	var thread []memory.Turn
+	prompt := question
+	if h.recall != nil {
+		if msg.ReplyToMessage == nil {
+			thread = h.recall.Latest(msg.Chat.ID)
+		} else if h.isOwnMessage(msg.ReplyToMessage) {
+			thread = h.recall.Thread(msg.Chat.ID, messageText(msg.ReplyToMessage))
+		}
+	}
+	if msg.ReplyToMessage != nil && len(thread) == 0 {
+		// Nothing remembered for what was replied to — someone else's message,
+		// or an answer that has gone cold — so the quote is all the context.
+		prompt = mdtext.BuildPrompt(question,
+			strings.TrimSpace(messageText(msg.ReplyToMessage)),
+			h.isOwnMessage(msg.ReplyToMessage))
+	}
+
 	var budget int
 	if !privileged {
-		if maxRunes > 0 && len([]rune(question)) > maxRunes {
+		if maxRunes > 0 && len([]rune(prompt)) > maxRunes {
 			return h.sendPlain(ctx, msg.Chat.ID, msgTooLong)
 		}
 		switch verdict, _, limit := h.ration.Judge(userID); verdict {
@@ -535,12 +557,10 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 		system = h.rawSystemPrompt
 	}
 
-	// A private chat is a real conversation, so every message continues it —
-	// there is no reply-to signal to wait for the way guest mode needs one.
 	started := time.Now()
 	answer, err := h.think(llmCtx, llm.Request{
-		Prompt:    question,
-		History:   h.history(msg.Chat.ID, true),
+		Prompt:    prompt,
+		History:   llmTurns(thread),
 		System:    system,
 		MaxTokens: budget,
 	}, d)
@@ -566,7 +586,7 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 	log.Info("answered", "took", time.Since(started), "runes", len([]rune(answer)), "raw", raw)
 
 	if h.recall != nil {
-		h.recall.Remember(msg.Chat.ID, question, answer)
+		h.recall.Remember(msg.Chat.ID, thread, prompt, answer)
 	}
 
 	return h.sendRich(ctx, msg.Chat.ID, mdtext.Truncate(answer, h.maxReplyRunes))
@@ -634,9 +654,15 @@ func (h *Handler) expireCommandReply(ctx context.Context, log *slog.Logger, inli
 // answerQuestion is the text path: placeholder, model, edit.
 func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg telego.Message, question string, raw, privileged bool) error {
 	// Replying to one of our answers is the only signal that this is the same
-	// conversation. A fresh summon is a fresh topic even in the same chat, so it
-	// starts from nothing rather than inheriting whatever was discussed before.
+	// conversation, and it continues the thread of exactly that answer — not
+	// whatever the chat discussed last, and not only for whoever asked first. A
+	// fresh summon is a fresh topic even in the same chat, so it starts from
+	// nothing.
 	followUp := h.isOwnMessage(msg.ReplyToMessage)
+	var thread []memory.Turn
+	if followUp && h.recall != nil {
+		thread = h.recall.Thread(msg.Chat.ID, messageText(msg.ReplyToMessage))
+	}
 
 	prompt := mdtext.BuildPrompt(
 		question,
@@ -752,8 +778,7 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 		if cached, hit := h.cache.Get(cacheKey); hit {
 			log.Info("answered from cache", "runes", len([]rune(cached)))
 			if h.recall != nil {
-				h.recall.Forget(msg.Chat.ID)
-				h.recall.Remember(msg.Chat.ID, attribute(msg, prompt), cached)
+				h.recall.Remember(msg.Chat.ID, nil, attribute(msg, prompt), cached)
 			}
 			return h.editText(ctx, inlineID, mdtext.Truncate(cached, h.maxReplyRunes))
 		}
@@ -763,7 +788,7 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 	answer, err := h.think(llmCtx, llm.Request{
 		Prompt:    prompt,
 		Images:    attachments,
-		History:   h.history(msg.Chat.ID, followUp),
+		History:   llmTurns(thread),
 		System:    system,
 		MaxTokens: budget,
 	}, nil)
@@ -789,12 +814,13 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 		h.cache.Put(cacheKey, answer)
 	}
 	if h.recall != nil {
-		// Dropping the old thread here rather than before the call means a
-		// failed answer leaves the previous conversation intact.
-		if !followUp {
-			h.recall.Forget(msg.Chat.ID)
+		// With the thread in hand the quoted answer is already its last turn,
+		// so the bare question is what is worth remembering.
+		remembered := prompt
+		if len(thread) > 0 && strings.TrimSpace(question) != "" {
+			remembered = question
 		}
-		h.recall.Remember(msg.Chat.ID, attribute(msg, prompt), answer)
+		h.recall.Remember(msg.Chat.ID, thread, attribute(msg, remembered), answer)
 	}
 
 	return h.editText(ctx, inlineID, mdtext.Truncate(answer, h.maxReplyRunes))
@@ -978,15 +1004,11 @@ func (h *Handler) blocked(from *telego.User) bool {
 	return banned
 }
 
-// history returns what we remember of this conversation. A summon that is not a
-// reply to us gets none: in a group chat the previous exchange is usually
-// somebody else's, and dragging it in makes the answer talk about the wrong
-// thing.
-func (h *Handler) history(chatID int64, followUp bool) []llm.Turn {
-	if h.recall == nil || !followUp {
+// llmTurns hands a remembered thread to the model.
+func llmTurns(remembered []memory.Turn) []llm.Turn {
+	if len(remembered) == 0 {
 		return nil
 	}
-	remembered := h.recall.History(chatID)
 	turns := make([]llm.Turn, 0, len(remembered))
 	for _, t := range remembered {
 		turns = append(turns, llm.Turn{Role: t.Role, Content: t.Content})
