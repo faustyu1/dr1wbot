@@ -65,7 +65,7 @@ type Downloader interface {
 // Remembrancer keeps the short conversation history guest mode does not give us,
 // one thread per answer, so a reply continues the chain it points at.
 type Remembrancer interface {
-	Thread(chatID int64, answer string) []memory.Turn
+	Thread(answer string, chatIDs ...int64) []memory.Turn
 	Latest(chatID int64) []memory.Turn
 	Remember(chatID int64, history []memory.Turn, question, answer string)
 }
@@ -503,7 +503,7 @@ func (h *Handler) HandleDirectMessage(ctx context.Context, msg telego.Message) e
 		if msg.ReplyToMessage == nil {
 			thread = h.recall.Latest(msg.Chat.ID)
 		} else if h.isOwnMessage(msg.ReplyToMessage) {
-			thread = h.recall.Thread(msg.Chat.ID, messageText(msg.ReplyToMessage))
+			thread = h.thread(msg)
 		}
 	}
 	if msg.ReplyToMessage != nil && len(thread) == 0 {
@@ -661,7 +661,7 @@ func (h *Handler) answerQuestion(ctx context.Context, log *slog.Logger, msg tele
 	followUp := h.isOwnMessage(msg.ReplyToMessage)
 	var thread []memory.Turn
 	if followUp && h.recall != nil {
-		thread = h.recall.Thread(msg.Chat.ID, messageText(msg.ReplyToMessage))
+		thread = h.thread(msg)
 	}
 
 	prompt := mdtext.BuildPrompt(
@@ -1002,6 +1002,25 @@ func (h *Handler) blocked(from *telego.User) bool {
 	h.bouncer.Note(from.ID, from.Username)
 	_, banned := h.bouncer.Blocked(from.ID, from.Username)
 	return banned
+}
+
+// thread finds the conversation behind the answer msg replies to.
+//
+// The answer is filed under the chat it was asked in, and a reply may see that
+// chat under another id: in a private chat between two people the id the bot
+// is shown can depend on who is writing. So besides the reply's own chat it
+// looks under the chat our answer says it was summoned from and, in a private
+// chat, under the sender — which is the id the other person's summon carried.
+func (h *Handler) thread(msg telego.Message) []memory.Turn {
+	quoted := msg.ReplyToMessage
+	ids := []int64{msg.Chat.ID}
+	if quoted.GuestBotCallerChat != nil {
+		ids = append(ids, quoted.GuestBotCallerChat.ID)
+	}
+	if msg.Chat.Type == telego.ChatTypePrivate && msg.From != nil {
+		ids = append(ids, msg.From.ID)
+	}
+	return h.recall.Thread(messageText(quoted), ids...)
 }
 
 // llmTurns hands a remembered thread to the model.

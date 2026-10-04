@@ -97,16 +97,24 @@ func New(opts Options) *Store {
 	}
 }
 
-// Thread returns the turns that led up to and include one of our answers in a
-// chat, oldest first. answer is the text as the reply quoted it.
-func (s *Store) Thread(chatID int64, answer string) []Turn {
+// Thread returns the turns that led up to and include one of our answers,
+// oldest first. answer is the text as the reply quoted it; chatIDs are the ids
+// the conversation may be filed under, tried in order. There can be more than
+// one: in a private chat between two people Telegram may show the chat to the
+// bot under a different id depending on who is writing.
+func (s *Store) Thread(answer string, chatIDs ...int64) []Turn {
 	key := Key(answer)
 	if key == "" {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.lookupLocked(threadID{chatID, key})
+	for _, chatID := range chatIDs {
+		if turns := s.lookupLocked(threadID{chatID, key}); turns != nil {
+			return turns
+		}
+	}
+	return nil
 }
 
 // Latest returns the thread of the last answer given in a chat.
