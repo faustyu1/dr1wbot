@@ -605,7 +605,7 @@ func TestAFailedAnswerKeepsThePreviousThread(t *testing.T) {
 
 	// The failed summon never became a conversation, so the earlier one is still
 	// there for whoever replies to it.
-	if len(store.Thread(-100500, "ответ")) == 0 {
+	if len(store.Thread("ответ", -100500)) == 0 {
 		t.Error("history was dropped by a summon that never got an answer")
 	}
 }
@@ -667,6 +667,45 @@ func TestDirectReplyToAnOlderAnswerContinuesItsOwnThread(t *testing.T) {
 	history := model.lastHistory(t)
 	if len(history) != 2 || history[0].Content != "что такое CAP" {
 		t.Errorf("history = %+v, want only the thread of the answer that was replied to", history)
+	}
+}
+
+func TestBothSidesOfAPrivateChatShareTheThread(t *testing.T) {
+	sender := &fakeSender{}
+	model := &fakeModel{answer: "CAP — это теорема"}
+	store := memory.New(memory.Options{})
+	h := newHandler(sender, model, handlerOpts{memory: store})
+
+	// Two people in a private chat: each one's summon shows the chat under the
+	// other one's id.
+	first := guestMessage("@dr1wbot что такое CAP")
+	first.Chat = telego.Chat{ID: 222, Type: telego.ChatTypePrivate}
+	first.From = &telego.User{ID: 111}
+	if err := h.HandleGuestMessage(context.Background(), first); err != nil {
+		t.Fatalf("HandleGuestMessage() error = %v", err)
+	}
+
+	model.answer = "Подробно: согласованность"
+	second := guestMessage("@dr1wbot а подробнее?")
+	second.Chat = telego.Chat{ID: 111, Type: telego.ChatTypePrivate}
+	second.From = &telego.User{ID: 222}
+	second.ReplyToMessage = ownAnswer("CAP — это теорема")
+	if err := h.HandleGuestMessage(context.Background(), second); err != nil {
+		t.Fatalf("HandleGuestMessage() error = %v", err)
+	}
+	if history := model.lastHistory(t); len(history) != 2 {
+		t.Fatalf("history = %+v, want the other person's exchange", history)
+	}
+
+	third := guestMessage("@dr1wbot а пример?")
+	third.Chat = telego.Chat{ID: 222, Type: telego.ChatTypePrivate}
+	third.From = &telego.User{ID: 111}
+	third.ReplyToMessage = ownAnswer("Подробно: согласованность")
+	if err := h.HandleGuestMessage(context.Background(), third); err != nil {
+		t.Fatalf("HandleGuestMessage() error = %v", err)
+	}
+	if history := model.lastHistory(t); len(history) != 4 {
+		t.Errorf("history = %+v, want the whole shared thread", history)
 	}
 }
 
